@@ -9,3 +9,4 @@ artifacts/
 data/raw/
 data/derived/
 *.jsonl.tmp
+*.sh
