@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Iterable
+
+from .qacc import audit_rows, file_sha256, load_raw_qacc, prepare_example
+from .schemas import PreparedExample
+
+
+STRICT_EXCLUSION_FLAGS = {
+    "truncated_fourth_answer",
+    "candidate_without_context",
+    "no_answer_candidate",
+    "correct_answer_unmapped",
+    "duplicate_candidate_answer",
+}
+
+
+def write_jsonl(path: Path, records: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def read_prepared(path: Path) -> list[PreparedExample]:
+    examples: list[PreparedExample] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                examples.append(PreparedExample.from_dict(json.loads(line)))
+    return examples
+
+
+def read_references(path: Path) -> dict[str, tuple[str, ...]]:
+    references: dict[str, tuple[str, ...]] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                record = json.loads(line)
+                references[str(record["question_id"])] = tuple(
+                    str(value) for value in record.get("references", [])
+                )
+    return references
+
+
+def read_evaluation_metadata(path: Path) -> dict[str, dict]:
+    metadata: dict[str, dict] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                record = json.loads(line)
+                metadata[str(record["question_id"])] = {
+                    "references": tuple(
+                        str(value) for value in record.get("references", [])
+                    ),
+                    "has_conflict": record.get("has_conflict"),
+                }
+    return metadata
+
+
+def _test_input(example: PreparedExample) -> PreparedExample:
+    return PreparedExample(
+        question_id=example.question_id,
+        split=example.split,
+        question=example.question,
+        contexts=example.contexts,
+        supervision=None,
+        evaluation=None,
+        quality_flags=example.quality_flags,
+    )
+
+
+def _write_test_pair(prefix: Path, examples: list[PreparedExample]) -> None:
+    write_jsonl(
+        Path(str(prefix) + ".inputs.jsonl"),
+        (_test_input(item).to_dict() for item in examples),
+    )
+    write_jsonl(
+        Path(str(prefix) + ".references.jsonl"),
+        (
+            {
+                "question_id": item.question_id,
+                "references": list((item.evaluation or {}).get("references", [])),
+                "has_conflict": (item.evaluation or {}).get("has_conflict"),
+            }
+            for item in examples
+        ),
+    )
+
+
+def is_strict_training_example(example: PreparedExample) -> bool:
+    return (
+        example.split in {"train", "dev"}
+        and not (set(example.quality_flags) & STRICT_EXCLUSION_FLAGS)
+        and example.supervision is not None
+    )
+
+
+def prepare_protocol(
+    raw_path: Path,
+    output_dir: Path,
+    *,
+    revision: str | None = None,
+) -> dict:
+    rows = load_raw_qacc(raw_path)
+    examples = [prepare_example(row, position) for position, row in enumerate(rows)]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for split in ("train", "dev"):
+        weak = [example for example in examples if example.split == split]
+        strict = [example for example in weak if is_strict_training_example(example)]
+        write_jsonl(output_dir / f"{split}.weak.jsonl", (item.to_dict() for item in weak))
+        write_jsonl(output_dir / f"{split}.strict.jsonl", (item.to_dict() for item in strict))
+
+    test = [example for example in examples if example.split == "test"]
+    # The official test retains duplicates and all quality flags. A separate
+    # sensitivity cohort removes repeated question/id pairs without changing labels.
+    _write_test_pair(output_dir / "test.official", test)
+    seen: set[str] = set()
+    deduplicated: list[PreparedExample] = []
+    for item in test:
+        key = item.question.casefold().strip()
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(item)
+    _write_test_pair(output_dir / "test.deduplicated_sensitivity", deduplicated)
+
+    audit = audit_rows(rows)
+    (output_dir / "audit.json").write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "protocol_version": "1.0",
+        "raw_path": str(raw_path.resolve()),
+        "raw_sha256": file_sha256(raw_path),
+        "upstream_revision": revision,
+        "raw_rows": len(rows),
+        "strict_exclusion_flags": sorted(STRICT_EXCLUSION_FLAGS),
+        "files": {
+            "train_weak": "train.weak.jsonl",
+            "train_strict": "train.strict.jsonl",
+            "dev_weak": "dev.weak.jsonl",
+            "dev_strict": "dev.strict.jsonl",
+            "test_official_inputs": "test.official.inputs.jsonl",
+            "test_official_references": "test.official.references.jsonl",
+            "test_deduplicated_sensitivity_inputs": "test.deduplicated_sensitivity.inputs.jsonl",
+            "test_deduplicated_sensitivity_references": "test.deduplicated_sensitivity.references.jsonl",
+            "audit": "audit.json",
+        },
+        "leakage_policy": {
+            "inference_inputs": ["question", "contexts.text", "contexts.source"],
+            "train_dev_only": ["supervision"],
+            "evaluation_only": ["evaluation.references", "evaluation.has_conflict"],
+        },
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
