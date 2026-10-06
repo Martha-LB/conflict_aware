@@ -1,3 +1,5 @@
+"""Command line entry for the final ARSR experiment."""
+
 from __future__ import annotations
 
 import argparse
@@ -32,11 +34,16 @@ from .uncertainty_routing import (
 )
 
 
+# Small helpers used by all commands.
 def _print(value: object) -> None:
+    """Print stable, readable JSON for shell users."""
+
     print(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True, default=str))
 
 
 def _read_jsonl(path: Path) -> dict[str, dict]:
+    """Load generic JSONL records and reject duplicate ids."""
+
     records: dict[str, dict] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -51,10 +58,14 @@ def _read_jsonl(path: Path) -> dict[str, dict]:
 
 
 def _reasoning_effort(value: str) -> str | None:
+    """Translate the CLI word 'omit' to an absent API field."""
+
     return None if value == "omit" else value
 
 
 def command_audit(args: argparse.Namespace) -> None:
+    """Inspect the untouched QACC release and save its data report."""
+
     report = audit_rows(load_raw_qacc(args.raw))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +74,8 @@ def command_audit(args: argparse.Namespace) -> None:
 
 
 def command_prepare(args: argparse.Namespace) -> None:
+    """Create the leakage-safe files used by all later commands."""
+
     _print(
         prepare_protocol(
             args.raw,
@@ -74,6 +87,8 @@ def command_prepare(args: argparse.Namespace) -> None:
 
 
 def command_extract(args: argparse.Namespace) -> None:
+    """Extract per-context answers with resumable API calls."""
+
     examples = read_prepared(args.data)[args.offset :]
     if args.limit is not None:
         examples = examples[: args.limit]
@@ -86,6 +101,7 @@ def command_extract(args: argparse.Namespace) -> None:
         structured_output=not args.json_mode,
         reasoning_effort=_reasoning_effort(args.reasoning_effort),
     )
+    # Provenance prevents an old cache from being reused with new settings.
     identity = {
         "input": str(args.data.resolve()),
         "input_sha256": file_sha256(args.data),
@@ -98,6 +114,7 @@ def command_extract(args: argparse.Namespace) -> None:
     }
     manifest_path = Path(str(args.output) + ".manifest.json")
     temporary_path = args.output.with_suffix(args.output.suffix + ".tmp")
+    # A resume is valid only when all output-changing inputs still match.
     if not args.no_resume and (args.output.exists() or temporary_path.exists()):
         if not manifest_path.exists():
             raise ValueError("Existing extraction cache has no provenance manifest")
@@ -117,6 +134,7 @@ def command_extract(args: argparse.Namespace) -> None:
                 + ", ".join(mismatches)
             )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Mark the run before API calls, then replace this state on completion.
     manifest_path.write_text(
         json.dumps(
             {**identity, "offset": args.offset, "limit": args.limit, "status": "running"},
@@ -150,6 +168,8 @@ def command_extract(args: argparse.Namespace) -> None:
 
 
 def command_answer_baseline(args: argparse.Namespace) -> None:
+    """Run one frozen answer prompt and cache every response."""
+
     examples = read_prepared(args.data)[args.offset :]
     if args.limit is not None:
         examples = examples[: args.limit]
@@ -162,6 +182,7 @@ def command_answer_baseline(args: argparse.Namespace) -> None:
         retries=args.retries,
         reasoning_effort=_reasoning_effort(args.reasoning_effort),
     )
+    # The prompt hash makes prompt changes visible in saved results.
     identity = {
         "input": str(args.data.resolve()),
         "input_sha256": file_sha256(args.data),
@@ -175,6 +196,7 @@ def command_answer_baseline(args: argparse.Namespace) -> None:
     }
     manifest_path = Path(str(args.output) + ".manifest.json")
     temporary_path = args.output.with_suffix(args.output.suffix + ".tmp")
+    # Refuse to mix models, prompts, or input versions in one cache.
     if not args.no_resume and (args.output.exists() or temporary_path.exists()):
         if not manifest_path.exists():
             raise ValueError("Existing answer cache has no provenance manifest")
@@ -219,9 +241,12 @@ def command_answer_baseline(args: argparse.Namespace) -> None:
 
 
 def command_evaluate_answer(args: argparse.Namespace) -> None:
+    """Score an answer cache and keep test references out of generation."""
+
     examples = read_prepared(args.data)
     references = None
     metadata = None
+    # Official test answers live in a separate file by design.
     if any(example.split == "test" for example in examples):
         if args.references is None:
             raise ValueError("Test evaluation requires --references")
@@ -240,6 +265,9 @@ def command_evaluate_answer(args: argparse.Namespace) -> None:
 
 
 def command_arsr_train_dev(args: argparse.Namespace) -> None:
+    """Fit ARSR on train and use dev only for calibration and selection."""
+
+    # Fit on train, then choose settings on dev.
     summary = run_uncertainty_routing_train_dev(
         read_prepared(args.train_data),
         read_prepared(args.dev_data),
@@ -259,6 +287,7 @@ def command_arsr_train_dev(args: argparse.Namespace) -> None:
         seed=args.seed,
         output_path=args.output,
     )
+    # Hash every input artifact used to produce the frozen model.
     input_paths = {
         "train_data": args.train_data,
         "dev_data": args.dev_data,
@@ -293,6 +322,9 @@ def command_arsr_train_dev(args: argparse.Namespace) -> None:
 
 
 def command_arsr_predict(args: argparse.Namespace) -> None:
+    """Create official-test predictions using a frozen ARSR model."""
+
+    # Test references are not loaded here.
     if args.output.exists():
         raise ValueError(f"Frozen prediction output already exists: {args.output}")
     model = json.loads(args.model.read_text(encoding="utf-8"))
@@ -311,6 +343,7 @@ def command_arsr_predict(args: argparse.Namespace) -> None:
         "extractions": args.extractions,
         "model": args.model,
     }
+    # This manifest proves that references were not a prediction input.
     manifest = {
         "protocol": "frozen_official_test_prediction_without_references",
         "protocol_version": model["protocol_version"],
@@ -334,6 +367,9 @@ def command_arsr_predict(args: argparse.Namespace) -> None:
 
 
 def command_arsr_evaluate(args: argparse.Namespace) -> None:
+    """Join frozen predictions with references in a separate score step."""
+
+    # References enter only after prediction.
     if args.output.exists():
         raise ValueError(f"Scored output already exists: {args.output}")
     summary = evaluate_frozen_uncertainty_routing_predictions(
@@ -369,6 +405,8 @@ def command_arsr_evaluate(args: argparse.Namespace) -> None:
 
 
 def command_identifiability_report(args: argparse.Namespace) -> None:
+    """Compare primary, resolver, no-context, and oracle systems."""
+
     examples = read_prepared(args.data)
     metadata = read_evaluation_metadata(args.references)
     references = {
@@ -378,6 +416,7 @@ def command_identifiability_report(args: argparse.Namespace) -> None:
         question_id: bool(item.get("has_conflict", False))
         for question_id, item in metadata.items()
     }
+    # A field name lets the report read answers from different artifact shapes.
     systems: dict[str, tuple[dict[str, dict], str]] = {}
     for name, path_text, field in args.prediction:
         if name in systems:
@@ -405,6 +444,8 @@ def command_identifiability_report(args: argparse.Namespace) -> None:
 
 
 def _add_api_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the same network options to all model commands."""
+
     parser.add_argument("--endpoint", default="https://api.openai.com/v1/chat/completions")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -417,9 +458,13 @@ def _add_api_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the small public CLI for the final experiment."""
+
+    # Only final project commands are kept.
     parser = argparse.ArgumentParser(prog="uacaa")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    # Data preparation commands do not call a model.
     audit = commands.add_parser("audit", help="Audit the untouched QACC file")
     audit.add_argument("--raw", type=Path, required=True)
     audit.add_argument("--output", type=Path)
@@ -432,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--ambigqa", type=Path, nargs="+", default=[])
     prepare.set_defaults(function=command_prepare)
 
+    # Model calls are cached because they are slow and cost money.
     extract = commands.add_parser("extract", help="Extract one answer per context")
     extract.add_argument("--data", type=Path, required=True)
     extract.add_argument("--output", type=Path, required=True)
@@ -469,6 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.set_defaults(function=command_evaluate_answer)
 
+    # ARSR training, frozen prediction, and evaluation remain separate commands.
     train = commands.add_parser(
         "arsr-train-dev", help="Fit ARSR on train and calibrate it on dev"
     )
@@ -538,6 +585,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse one command and run its bound handler."""
+
     args = build_parser().parse_args()
     args.function(args)
 

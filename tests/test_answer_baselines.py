@@ -1,3 +1,5 @@
+"""Tests for baseline prompts, cache, and scores."""
+
 from pathlib import Path
 
 from uacaa.answer_baselines import (
@@ -12,6 +14,7 @@ from uacaa.schemas import Context, PreparedExample
 
 
 class _Predictor:
+    """A fake predictor. It avoids real API calls."""
     def __init__(self):
         self.calls = 0
 
@@ -21,6 +24,8 @@ class _Predictor:
 
 
 def _examples():
+    """Create two small labelled questions for local tests."""
+
     return [
         PreparedExample(
             str(index),
@@ -34,6 +39,7 @@ def _examples():
 
 
 def test_answer_baseline_cache_resumes_and_evaluates(tmp_path: Path):
+    # First write one answer, then check that resume calls the model only once.
     output = tmp_path / "answers.jsonl"
     first = _Predictor()
     assert write_answer_cache(_examples()[:1], first, output)["extracted"] == 1
@@ -47,6 +53,7 @@ def test_answer_baseline_cache_resumes_and_evaluates(tmp_path: Path):
 
 
 def test_answer_baseline_prompts_require_minimal_answer_span():
+    # Long answer sentences can lower QACC exact match.
     assert "minimal slot-filling answer span" in DIRECT_RAG_SYSTEM_PROMPT
     assert "minimal slot-filling answer span" in QACC_EXPLAIN_SYSTEM_PROMPT
     assert "reasoning only" in QACC_EXPLAIN_SYSTEM_PROMPT
@@ -54,6 +61,7 @@ def test_answer_baseline_prompts_require_minimal_answer_span():
 
 
 def test_answer_baseline_reports_conflict_slice():
+    # The labelled conflict result must remain visible beside the full score.
     examples = _examples()
     predictions = {
         "0": {"answer": "Paris", "explanation": ""},

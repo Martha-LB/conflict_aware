@@ -1,3 +1,5 @@
+"""Normalize answers and compute QACC scores."""
+
 from __future__ import annotations
 
 import re
@@ -37,6 +39,7 @@ _COUNT_UNITS = {"episode", "episodes", "seat", "seats", "time", "times"}
 
 
 def normalize_answer(value: object) -> str:
+    """Loose normalization for internal matching."""
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(character for character in text if not unicodedata.combining(character))
     text = text.lower().replace("&", " and ")
@@ -50,10 +53,14 @@ def normalize_answer(value: object) -> str:
 
 
 def is_no_answer(value: object) -> bool:
+    """Recognize the abstention strings used by the prompts."""
+
     return normalize_answer(value) in _NO_ANSWER
 
 
 def token_f1(left: object, right: object) -> float:
+    """Compute multiset token F1 for internal answer matching."""
+
     left_tokens = normalize_answer(left).split()
     right_tokens = normalize_answer(right).split()
     if not left_tokens or not right_tokens:
@@ -67,6 +74,8 @@ def token_f1(left: object, right: object) -> float:
 
 
 def exact_match(left: object, right: object) -> bool:
+    """Compare two answers after loose internal normalization."""
+
     left_key = normalize_answer(left)
     right_key = normalize_answer(right)
     return bool(left_key) and left_key == right_key
@@ -109,10 +118,12 @@ def qacc_token_f1(left: object, right: object) -> float:
 
 
 def answers_match(left: object, right: object, *, threshold: float = 0.8) -> bool:
+    """Match answer aliases inside the pipeline."""
     left_key = normalize_answer(left)
     right_key = normalize_answer(right)
     if not left_key or not right_key:
         return False
+    # Exact normalized text is always the safest alias match.
     if left_key == right_key:
         return True
     # Numeric order is semantic in ratios, ranges, rankings, and many dates.
@@ -179,6 +190,8 @@ def best_answer_index(
     *,
     threshold: float = 0.8,
 ) -> int | None:
+    """Return the closest candidate, or None when no candidate is close."""
+
     scores = [token_f1(target, candidate) for candidate in candidates]
     exact = [index for index, candidate in enumerate(candidates) if answers_match(target, candidate)]
     if exact:
@@ -187,13 +200,14 @@ def best_answer_index(
         return None
     index = int(max(range(len(scores)), key=scores.__getitem__))
     return index if scores[index] >= threshold else None
+# These wrapper words may be removed without changing a short answer.
 _SAFE_SURFACE_MODIFIERS = {
     "during", "each", "every", "in", "month", "months", "of", "on", "throughout",
 }
 
 
 def safe_surface_equivalent(left: object, right: object) -> bool:
-    """Match only harmless wrappers around the same minimal answer span."""
+    """Match harmless wrappers while preserving numbers and names."""
     if exact_match(left, right):
         return True
     left_key = normalize_answer(left)

@@ -1,3 +1,5 @@
+"""Extract one answer and evidence quote from each context."""
+
 from __future__ import annotations
 
 import hashlib
@@ -16,6 +18,7 @@ from .normalization import is_no_answer
 from .schemas import EvidenceObservation, PreparedExample
 
 
+# One request checks all contexts. Each context is judged alone.
 SYSTEM_PROMPT = """You extract candidate answers from web snippets for factual QA.
 Treat every context independently even though they are shown together. Never compare contexts,
 vote across them, suppress a minority answer, or decide which candidate is globally correct.
@@ -83,10 +86,14 @@ EXTRACTION_SCHEMA = {
 
 
 class CandidateExtractor(Protocol):
+    """Interface shared by the API extractor and test doubles."""
+
     def extract(self, example: PreparedExample) -> list[EvidenceObservation]: ...
 
 
 def extraction_prompt(example: PreparedExample) -> str:
+    """Render all contexts with explicit zero-based indices."""
+
     rendered = "\n\n".join(
         f"[{context.index}] source={context.source or 'unknown'}\n{context.text}"
         for context in example.contexts
@@ -102,7 +109,10 @@ def parse_context_assessments(
     quarantine_malformed_answerable: bool = False,
     quarantine_structural_errors: bool = False,
 ) -> tuple[list[EvidenceObservation], list[dict]]:
+    """Validate model JSON and keep one assessment for every context."""
+
     cleaned = text.strip()
+    # Accept JSON wrapped in a Markdown fence from non-strict models.
     if cleaned.startswith("```"):
         cleaned = cleaned.removeprefix("```json").removeprefix("```")
         cleaned = cleaned.removesuffix("```").strip()
@@ -114,6 +124,7 @@ def parse_context_assessments(
     assessments: list[dict] = []
     seen: set[int] = set()
     duplicate_indices: set[int] = set()
+    # Structural errors are retried first and quarantined only on the last try.
     for item in items:
         index = int(item["context_index"])
         if index < 0 or index >= context_count:
@@ -167,6 +178,7 @@ def parse_context_assessments(
             "temporal_fit": float(item.get("temporal_fit", 0.0)),
         }
         assessments.append(assessment)
+        # Unanswerable contexts stay in assessments but create no candidate.
         if not answerable:
             continue
         if is_no_answer(answer) or not quote:
@@ -187,6 +199,7 @@ def parse_context_assessments(
                 temporal_fit=assessment["temporal_fit"],
             )
         )
+    # Missing rows would hide weak or irrelevant contexts from the audit.
     missing = sorted(set(range(context_count)) - seen)
     if missing and not allow_missing:
         raise ValueError(f"Extractor omitted context_indices: {missing}")
@@ -225,11 +238,15 @@ def parse_context_assessments(
 
 
 def parse_extraction_response(text: str, context_count: int) -> list[EvidenceObservation]:
+    """Compatibility wrapper that returns accepted observations only."""
+
     observations, _ = parse_context_assessments(text, context_count)
     return observations
 
 
 def evidence_quote_is_verbatim(quote: str, context: str) -> bool:
+    """Check if a quote occurs after only Unicode and space cleanup."""
+
     def normalize(value: str) -> str:
         value = unicodedata.normalize("NFKC", value).casefold()
         return re.sub(r"\s+", " ", value).strip()
@@ -265,6 +282,7 @@ def align_evidence_quote(quote: str, context: str) -> str | None:
 
 
 class OpenAICompatibleExtractor:
+    """Call the model and validate every context row."""
     def __init__(
         self,
         model: str,
@@ -287,9 +305,12 @@ class OpenAICompatibleExtractor:
         self.last_response_metadata: dict | None = None
 
     def extract(self, example: PreparedExample) -> list[EvidenceObservation]:
+        """Extract candidates, repair safe quote differences, and retry failures."""
+
         key = os.environ.get(self.api_key_env, "").strip()
         if not key:
             raise RuntimeError(f"Environment variable {self.api_key_env} is not set")
+        # Structured output catches missing fields before local validation.
         response_format = (
             {
                 "type": "json_schema",
@@ -325,6 +346,7 @@ class OpenAICompatibleExtractor:
         last_error: Exception | None = None
         self.last_assessments = None
         self.last_response_metadata = None
+        # The final attempt keeps usable contexts instead of losing the question.
         for attempt in range(self.retries):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -343,6 +365,7 @@ class OpenAICompatibleExtractor:
                     assessment["context_index"]: assessment
                     for assessment in assessments
                 }
+                # Every context receives an audit status, even when rejected.
                 for assessment in assessments:
                     assessment["evidence_quote_raw"] = assessment["evidence_quote"]
                     assessment["accepted_for_candidate_aggregation"] = False
@@ -363,6 +386,7 @@ class OpenAICompatibleExtractor:
                             )
                         )
                     )
+                # Candidate evidence must point to a real span in its own context.
                 for observation in observations:
                     context = example.contexts[observation.context_index].text
                     raw_quote = observation.evidence_quote
@@ -475,6 +499,8 @@ def annotated_observations(example: PreparedExample) -> list[EvidenceObservation
 
 
 def cache_key(example: PreparedExample, model: str) -> str:
+    """Hash all inputs that can change extraction output."""
+
     payload = json.dumps(
         {
             "model": model,
@@ -495,12 +521,15 @@ def write_extraction_cache(
     *,
     resume: bool = True,
 ) -> dict[str, int]:
+    """Write resumable extraction records without mixing data slices."""
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
 
     completed: set[str] = set()
     seed = temporary if resume and temporary.exists() else output_path
     existing = ""
+    # Resume from the temporary file when the previous run stopped mid-write.
     if resume and seed.exists():
         existing = seed.read_text(encoding="utf-8")
         for line in existing.splitlines():
@@ -520,6 +549,7 @@ def write_extraction_cache(
 
     temporary.write_text(existing, encoding="utf-8")
     extracted = 0
+    # Save each expensive API result immediately.
     with temporary.open("a", encoding="utf-8") as handle:
         for example in examples:
             if example.question_id in completed:
@@ -544,6 +574,8 @@ def write_extraction_cache(
 
 
 def read_extraction_cache(path: Path) -> dict[str, list[EvidenceObservation]]:
+    """Load only accepted candidate observations from an extraction cache."""
+
     cache: dict[str, list[EvidenceObservation]] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:

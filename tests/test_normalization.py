@@ -1,3 +1,5 @@
+"""Tests for answer matching and the QACC score."""
+
 from uacaa.normalization import (
     answers_match,
     best_answer_index,
@@ -13,6 +15,7 @@ from uacaa.normalization import (
 
 
 def test_qacc_metrics_reproduce_released_evaluator():
+    # These examples lock the score to the public QACC implementation.
     assert qacc_normalize_text("The U.S.A.") == "usa"
     assert qacc_exact_match("The Beatles", "Beatles")
     assert not qacc_exact_match("Yamuna", "Yamuna River")
@@ -23,6 +26,7 @@ def test_qacc_metrics_reproduce_released_evaluator():
 
 
 def test_normalization_handles_articles_and_number_commas():
+    # Internal matching is intentionally looser than final scoring.
     assert normalize_answer("The 5,000") == "5000"
     assert answers_match("The Eiffel Tower", "Eiffel Tower")
     assert exact_match("The Eiffel Tower", "Eiffel Tower")
@@ -30,18 +34,21 @@ def test_normalization_handles_articles_and_number_commas():
 
 
 def test_numeric_conflicts_do_not_alias():
+    # Numbers and their order can change the factual answer.
     assert not answers_match("1850", "1858")
     assert not answers_match("3:2", "2:3")
     assert not target_matches_candidate("3:2", "2:3")
 
 
 def test_safe_surface_equivalence_preserves_material_details():
+    # Wrapper words are safe; added dates and place names are not.
     assert safe_surface_equivalent("October", "Throughout the month of October")
     assert not safe_surface_equivalent("1994", "October 31, 1994")
     assert not safe_surface_equivalent("Paris", "Paris, Texas")
 
 
 def test_candidate_mapping_allows_safe_gold_containment():
+    # Candidate mapping may accept a longer evidence span than final EM.
     assert target_matches_candidate("16 years", "16 years of age")
     assert target_matches_candidate(
         "Western Eastern Ghats",
@@ -52,6 +59,7 @@ def test_candidate_mapping_allows_safe_gold_containment():
 
 
 def test_candidate_mapping_handles_orthographic_and_count_variants():
+    # Common spelling and count-unit differences should map to one candidate.
     assert target_matches_candidate("meristematic tissue", "meristematic tissues")
     assert target_matches_candidate("Jimmy Mathews", "Jimmy Matthews")
     assert target_matches_candidate("June 28, 2018", "Jun 28, 2018")
@@ -62,5 +70,6 @@ def test_candidate_mapping_handles_orthographic_and_count_variants():
 
 
 def test_best_answer_index_uses_alias_similarity():
+    # The matching candidate should win even with a leading article.
     assert best_answer_index("Fourteenth Amendment", ["First Amendment", "The Fourteenth Amendment"]) == 1
     assert token_f1("December 1972", "December 7 19 1972") > 0

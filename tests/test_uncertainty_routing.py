@@ -1,3 +1,5 @@
+"""Tests for ARSR features, training, and frozen test use."""
+
 from pathlib import Path
 
 from uacaa.schemas import Context, EvidenceObservation, PreparedExample
@@ -12,6 +14,8 @@ from uacaa.uncertainty_routing import (
 
 
 def _example(index: int, gold: str, conflict: bool = False) -> PreparedExample:
+    """Create a question with source and time signals for ARSR."""
+
     candidates = [{"answer": gold, "context_indices": [0]}]
     if conflict:
         candidates.append({"answer": "wrong", "context_indices": [1]})
@@ -28,6 +32,7 @@ def _example(index: int, gold: str, conflict: bool = False) -> PreparedExample:
 
 
 def test_uq_features_include_conflict_source_and_time_signals():
+    # One example should activate every important feature family.
     example = _example(1, "Paris", conflict=True)
     features, metadata = build_uq_features(
         example,
@@ -46,6 +51,7 @@ def test_uq_features_include_conflict_source_and_time_signals():
 
 
 def test_uq_cross_validation_writes_oof_report(tmp_path: Path):
+    # Synthetic rows test the full out-of-fold path without model calls.
     examples = []
     luna = {}
     mini = {}
@@ -60,6 +66,7 @@ def test_uq_cross_validation_writes_oof_report(tmp_path: Path):
             EvidenceObservation(0, gold, entailment=0.9, directness=0.9)
         ]
     output = tmp_path / "uq.jsonl"
+    # Every output row must come from its held-out fold.
     summary = run_uncertainty_routing_cross_validation(
         examples,
         luna,
@@ -79,6 +86,7 @@ def test_uq_cross_validation_writes_oof_report(tmp_path: Path):
 
 
 def test_train_dev_router_is_symmetric_and_writes_model(tmp_path: Path):
+    # Fit and test with fake data, so no API call is needed.
     train = []
     dev = []
     primary = {}
@@ -120,6 +128,7 @@ def test_train_dev_router_is_symmetric_and_writes_model(tmp_path: Path):
     assert output.with_suffix(".summary.json").exists()
     assert output.with_suffix(".model.json").exists()
 
+    # The frozen stage receives test inputs without supervision.
     test_examples = []
     test_primary = {}
     test_secondary = {}
@@ -139,6 +148,7 @@ def test_train_dev_router_is_symmetric_and_writes_model(tmp_path: Path):
     prediction_path = tmp_path / "frozen.jsonl"
     import json
 
+    # Predict first; join references only in the later evaluation call.
     model = json.loads(output.with_suffix(".model.json").read_text())
     progress = write_frozen_uncertainty_routing_predictions(
         test_examples,

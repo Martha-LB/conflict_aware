@@ -1,3 +1,5 @@
+"""Read QACC and convert rows to the project format."""
+
 from __future__ import annotations
 
 import ast
@@ -18,6 +20,7 @@ from .normalization import (
 from .schemas import Context, PreparedExample
 
 
+# QACC stores answers in three named columns.
 ORDINALS = ("first", "second", "third")
 
 
@@ -35,10 +38,14 @@ def qacc_conflict_label(example: PreparedExample) -> bool:
 
 
 def _question_key(value: object) -> str:
+    """Create a stable question key for joining QACC and AmbigQA."""
+
     return " ".join(str(value or "").casefold().split()).rstrip("?").strip()
 
 
 def _deduplicate_references(values: Iterable[object]) -> list[str]:
+    """Remove empty and normalized duplicate reference answers."""
+
     references: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -102,6 +109,8 @@ def evaluation_references(example: PreparedExample) -> list[str]:
 
 
 def is_missing(value: Any) -> bool:
+    """Treat None, NaN, and blank text as missing QACC values."""
+
     return (
         value is None
         or (isinstance(value, float) and math.isnan(value))
@@ -110,6 +119,8 @@ def is_missing(value: Any) -> bool:
 
 
 def file_sha256(path: Path) -> str:
+    """Hash an input file for the reproducibility manifest."""
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -127,6 +138,8 @@ def load_raw_qacc(path: Path) -> list[dict[str, Any]]:
 
 
 def parse_context_labels(value: Any, context_count: int) -> list[int]:
+    """Convert QACC labels such as ['A', 'C'] to zero-based indices."""
+
     if is_missing(value):
         return []
     try:
@@ -136,6 +149,7 @@ def parse_context_labels(value: Any, context_count: int) -> list[int]:
     if not isinstance(labels, list):
         raise ValueError(f"QACC context labels must be a list: {value!r}")
     indices: list[int] = []
+    # QACC supports at most contexts A through J.
     for label in labels:
         key = str(label).strip().upper()
         if len(key) != 1 or not "A" <= key <= "J":
@@ -148,6 +162,8 @@ def parse_context_labels(value: Any, context_count: int) -> list[int]:
 
 
 def candidate_annotations(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read the first, second, and third annotated answer groups."""
+
     annotations: list[dict[str, Any]] = []
     context_count = len(row.get("contexts") or [])
     for ordinal in ORDINALS:
@@ -166,6 +182,8 @@ def candidate_annotations(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def row_quality_flags(row: dict[str, Any]) -> list[str]:
+    """Mark rows that are unsafe for the strict training split."""
+
     flags: list[str] = []
     annotations = candidate_annotations(row)
     if row.get("fourthAnswerExist") == "A":
@@ -190,6 +208,8 @@ def row_quality_flags(row: dict[str, Any]) -> list[str]:
 
 
 def _question_id(row: dict[str, Any], position: int) -> str:
+    """Build a unique id even when QACC annotation ids repeat."""
+
     raw_id = row.get("annotation_task_id")
     if not is_missing(raw_id):
         # Position keeps repeated official rows distinct in extraction caches
@@ -207,6 +227,9 @@ def prepare_example(
     *,
     upstream_references: Sequence[str] | None = None,
 ) -> PreparedExample:
+    """Convert one raw QACC row and keep labels away from model input."""
+
+    # Keep model input away from evaluation labels.
     texts = [str(value).strip() for value in row.get("contexts") or []]
     sources = row.get("sources") or []
     contexts = [
@@ -233,6 +256,7 @@ def prepare_example(
         "explanation": None if is_missing(row.get("explanation")) else str(row["explanation"]).strip(),
     }
     raw_references = row.get("ambigqa_answer")
+    # Official test rows already contain the evaluator reference list.
     references = (
         _deduplicate_references(raw_references)
         if isinstance(raw_references, list)
@@ -260,6 +284,9 @@ def prepare_example(
 
 
 def audit_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize split sizes, annotation coverage, and quality problems."""
+
+    # Count missing fields and split sizes.
     materialized = list(rows)
     split_summary: dict[str, Any] = {}
     for split in sorted({str(row.get("split") or "unknown") for row in materialized}):
@@ -270,6 +297,7 @@ def audit_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         candidate_counts: Counter[int] = Counter()
         questions: Counter[str] = Counter()
         ids: Counter[str] = Counter()
+        # Count row-level problems without modifying the released data.
         for position, row in enumerate(selected):
             annotations = candidate_annotations(row)
             candidate_counts[len(annotations)] += 1

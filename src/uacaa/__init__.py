@@ -1,4 +1,4 @@
-"""Answer-risk guided selective revision for conflicting-context QA."""
+"""Small public objects used by the project."""
 
 from .schemas import Candidate, EvidenceObservation, PreparedExample
 

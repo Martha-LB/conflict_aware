@@ -1,3 +1,5 @@
+"""Compare final systems with the official QACC score."""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +16,8 @@ EVALUATION_PROTOCOL = "qacc_public_normalized_em_f1_max_over_references"
 
 
 def read_jsonl_records(path: Path) -> dict[str, dict]:
+    """Read unique prediction records keyed by question id."""
+
     records: dict[str, dict] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -27,6 +31,8 @@ def read_jsonl_records(path: Path) -> dict[str, dict]:
 
 
 def _field(record: Mapping, field: str) -> object:
+    """Read a nested value from a dot-separated field name."""
+
     value: object = record
     for key in field.split("."):
         if not isinstance(value, Mapping):
@@ -36,6 +42,8 @@ def _field(record: Mapping, field: str) -> object:
 
 
 def _score(answer: object, references: Sequence[str]) -> tuple[float, float, bool]:
+    """Return QACC EM, F1, and abstention for one answer."""
+
     text = str(answer or "").strip()
     abstained = not text or is_no_answer(text)
     if abstained:
@@ -46,6 +54,7 @@ def _score(answer: object, references: Sequence[str]) -> tuple[float, float, boo
 
 
 def _oracle_candidate(record: Mapping, references: Sequence[str]) -> str:
+    # Gold references make this an upper bound only.
     candidates = [str(record.get("primary_answer", ""))]
     candidates.extend(
         str(card.get("answer", ""))
@@ -62,6 +71,8 @@ def _oracle_candidate(record: Mapping, references: Sequence[str]) -> str:
 
 
 def _answer(record: Mapping, field: str, references: Sequence[str]) -> str:
+    """Read a normal answer field or compute the oracle candidate."""
+
     if field == "oracle_candidate":
         return _oracle_candidate(record, references)
     value = _field(record, field)
@@ -79,6 +90,9 @@ def evaluate_identifiability(
     resolver_name: str | None = None,
     oracle_name: str | None = None,
 ) -> tuple[dict, list[dict]]:
+    """Measure what evidence exists and what each resolver can identify."""
+
+    # Keep every system score on the same question row.
     if primary_name not in systems:
         raise ValueError(f"Unknown primary system: {primary_name}")
     for role, name in {
@@ -88,6 +102,7 @@ def evaluate_identifiability(
     }.items():
         if name is not None and name not in systems:
             raise ValueError(f"Unknown {role} system: {name}")
+    # Missing references make the main outcome impossible to score.
     expected_ids = {example.question_id for example in examples}
     missing_references = sorted(expected_ids - set(references))
     if missing_references:
@@ -97,6 +112,7 @@ def evaluate_identifiability(
         )
 
     rows: list[dict] = []
+    # Store all system outcomes on the same row for paired comparisons.
     for example in examples:
         question_id = example.question_id
         item_references = [str(value) for value in references.get(question_id, ())]
@@ -119,6 +135,8 @@ def evaluate_identifiability(
         rows.append(row)
 
     def metrics(selected: Sequence[Mapping], name: str) -> dict:
+        """Summarize one system on one fixed data slice."""
+
         covered = [row for row in selected if not row[name]["abstained"]]
         return {
             "examples": len(selected),
@@ -134,6 +152,7 @@ def evaluate_identifiability(
             "missing_predictions": sum(row[name]["missing_prediction"] for row in selected),
         }
 
+    # Conflict and non-conflict rows answer different parts of the RQ.
     slices = {
         "overall": rows,
         "qacc_conflict": [row for row in rows if row["has_conflict"]],
@@ -141,6 +160,8 @@ def evaluate_identifiability(
     }
 
     def comparison(selected: Sequence[Mapping], name: str) -> dict:
+        """Count helpful and harmful changes against the primary answer."""
+
         changed = [
             row
             for row in selected
@@ -190,6 +211,7 @@ def evaluate_identifiability(
         },
         "identifiability_gaps": {},
     }
+    # Oracle gaps separate candidate availability from answer selection.
     for slice_name in slices:
         slice_metrics = summary["metrics"][slice_name]
         gaps = {}
@@ -218,6 +240,9 @@ def evaluate_identifiability(
 
 
 def write_identifiability_report(path: Path, summary: Mapping, rows: Sequence[Mapping]) -> None:
+    """Save machine-readable results and a short human-readable table."""
+
+    # Save JSON data and one short Markdown table.
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
     rows_path = path.with_suffix(".rows.jsonl")

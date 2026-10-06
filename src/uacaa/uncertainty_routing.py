@@ -1,3 +1,5 @@
+"""Estimate answer risk and revise selected answers."""
+
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +31,7 @@ from .schemas import EvidenceObservation, PreparedExample
 UQ_ROUTING_PROTOCOL_VERSION = "1.1"
 UNKNOWN = "unknown"
 
+# Full features are ready after the secondary answer.
 UQ_FEATURE_NAMES = (
     "log_context_count",
     "log_extracted_cluster_count",
@@ -58,8 +61,7 @@ UQ_FEATURE_NAMES = (
     "luna_log_answer_length",
 )
 
-# Stage one must be computable before the secondary model is called.  Features
-# derived from Mini are deliberately excluded from the pre-routing risk model.
+# These features are ready before the secondary call.
 PRE_ROUTING_FEATURE_NAMES = tuple(
     name for name in UQ_FEATURE_NAMES
     if name not in {
@@ -69,7 +71,11 @@ PRE_ROUTING_FEATURE_NAMES = tuple(
         "mini_minus_luna_entailment",
     }
 )
+
+
 def _pre_routing_indices(mode: str) -> np.ndarray:
+    """Select features available before paying for the secondary answer."""
+
     excluded: set[str]
     if mode == "full":
         excluded = set()
@@ -108,11 +114,15 @@ _TEMPORAL_CUE = re.compile(
 
 
 def _hash_fraction(value: str, salt: str) -> float:
+    """Map an id to a stable pseudo-random number in [0, 1)."""
+
     digest = hashlib.sha256(f"{salt}:{value}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") / float(2**64)
 
 
 def _answer(record: Mapping | None) -> str:
+    """Read one answer and replace blank values with unknown."""
+
     value = str((record or {}).get("answer", UNKNOWN)).strip()
     return value or UNKNOWN
 
@@ -122,12 +132,16 @@ def _support_summary(
     answer: str,
     observations: Sequence[EvidenceObservation],
 ) -> dict[str, float]:
+    """Describe how strongly the contexts support one model answer."""
+
+    # Only contexts with an equivalent extracted answer count as support.
     matched = [
         item for item in observations
         if safe_surface_equivalent(answer, item.candidate_answer)
     ]
     support_indices = {item.context_index for item in matched}
     context_by_index = {item.index: item for item in example.contexts}
+    # Repeated pages from one domain do not count as independent sources.
     domains = {
         normalize_domain(context_by_index[index].source)
         for index in support_indices
@@ -139,6 +153,8 @@ def _support_summary(
     context_tokens = set(" ".join(context_keys).split())
 
     def mean(name: str, default: float = 0.5) -> float:
+        """Average an extraction score, using neutral value without support."""
+
         values = [float(getattr(item, name)) for item in matched]
         return float(np.mean(values)) if values else default
 
@@ -165,6 +181,9 @@ def build_uq_features(
     mini_record: Mapping | None,
     observations: Sequence[EvidenceObservation] = (),
 ) -> tuple[np.ndarray, dict]:
+    """Build fixed-order risk features plus readable audit metadata."""
+
+    # Build conflict, support, source, and time signals.
     luna = _answer(luna_record)
     mini = _answer(mini_record)
     clusters = cluster_observations(observations)
@@ -172,6 +191,7 @@ def build_uq_features(
         [len({item.context_index for item in cluster.observations}) for cluster in clusters],
         dtype=float,
     )
+    # Entropy is high when context votes are spread across answer clusters.
     if len(counts) > 1 and float(counts.sum()) > 0:
         probabilities = counts / counts.sum()
         semantic_entropy = -float(
@@ -183,6 +203,7 @@ def build_uq_features(
         semantic_entropy = 0.0
         vote_uncertainty = 0.0
     cluster_answers = [normalize_answer(cluster.answer) for cluster in clusters]
+    # Different numbers are a strong and easy-to-observe conflict signal.
     numeric_conflict = any(
         bool(_NUMBER.search(left) and _NUMBER.search(right))
         and set(_NUMBER.findall(left)) != set(_NUMBER.findall(right))
@@ -196,6 +217,7 @@ def build_uq_features(
     unique_domains = set(domains)
     categories = Counter(source_category(domain) for domain in unique_domains)
     category_total = max(len(unique_domains), 1)
+    # Near-duplicate contexts should not look like independent evidence.
     duplicate_pairs = 0
     total_pairs = 0
     for index, left in enumerate(example.contexts):
@@ -211,6 +233,7 @@ def build_uq_features(
         for context in example.contexts
         for value in _YEAR.findall(context.text)
     ]
+    # Large year gaps can signal temporal rather than factual disagreement.
     year_dispersion = (
         min(1.0, math.log1p(max(years) - min(years)) / math.log1p(100.0))
         if len(years) >= 2 else 0.0
@@ -259,9 +282,12 @@ def build_uq_features(
 
 @dataclass
 class _RidgeLogit:
+    """Small regularized logistic risk model."""
     prior_scale: float = 0.75
 
     def fit(self, matrix: np.ndarray, labels: np.ndarray) -> "_RidgeLogit":
+        """Fit standardized logistic regression with L2 shrinkage."""
+
         matrix = np.asarray(matrix, dtype=float)
         labels = np.asarray(labels, dtype=float)
         self.mean_ = matrix.mean(axis=0)
@@ -271,6 +297,7 @@ class _RidgeLogit:
         design = np.column_stack([np.ones(len(transformed)), transformed])
         precision = 1.0 / (self.prior_scale**2)
 
+        # The intercept is not regularized because it stores the base error rate.
         def objective(beta: np.ndarray) -> tuple[float, np.ndarray]:
             scores = design @ beta
             loss = float(np.sum(np.logaddexp(0.0, scores) - labels * scores))
@@ -289,14 +316,20 @@ class _RidgeLogit:
         return self
 
     def logits(self, matrix: np.ndarray) -> np.ndarray:
+        """Return uncalibrated log odds for each example."""
+
         transformed = (np.asarray(matrix, dtype=float) - self.mean_) / self.scale_
         design = np.column_stack([np.ones(len(transformed)), transformed])
         return design @ self.coefficients_
 
     def predict(self, matrix: np.ndarray) -> np.ndarray:
+        """Return calibrated probabilities of answer error."""
+
         return expit(self.logits(matrix) / self.temperature_)
 
     def calibrate_temperature(self, matrix: np.ndarray, labels: np.ndarray) -> float:
+        """Fit one temperature on held-out calibration examples."""
+
         if len(matrix) < 2:
             return self.temperature_
         logits = self.logits(matrix)
@@ -314,12 +347,16 @@ class _RidgeLogit:
 
 
 def _is_correct(answer: str, references: Sequence[str]) -> bool:
+    """Use QACC exact match against any allowed reference."""
+
     return not is_no_answer(answer) and any(
         qacc_exact_match(answer, value) for value in references
     )
 
 
 def _answer_metrics(rows: Sequence[Mapping], answer_key: str) -> dict:
+    """Compute EM, token F1, coverage, and selective EM."""
+
     exact_values: list[float] = []
     f1_values: list[float] = []
     covered: list[float] = []
@@ -345,6 +382,8 @@ def _answer_metrics(rows: Sequence[Mapping], answer_key: str) -> dict:
 
 
 def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
+    """Compute AUROC with average ranks for tied scores."""
+
     positive = int(labels.sum())
     negative = len(labels) - positive
     if not positive or not negative:
@@ -363,6 +402,8 @@ def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
 
 
 def _average_precision(labels: np.ndarray, scores: np.ndarray) -> float | None:
+    """Compute average precision for rare answer errors."""
+
     positives = int(labels.sum())
     if not positives:
         return None
@@ -379,11 +420,14 @@ def _risk_quality(
     correct_key: str = "luna_correct",
     score_key: str = "luna_error_probability",
 ) -> dict:
+    """Measure discrimination, calibration, and selective prediction."""
+
     labels = np.asarray([not row[correct_key] for row in rows], dtype=float)
     scores = np.asarray([row[score_key] for row in rows], dtype=float)
     order = np.argsort(scores, kind="stable")
     ordered_errors = labels[order]
     cumulative_risk = np.cumsum(ordered_errors) / np.arange(1, len(rows) + 1)
+    # Ten fixed bins make calibration errors easy to inspect.
     bins = []
     calibration_error = 0.0
     for lower in np.linspace(0.0, 0.9, 10):
@@ -399,6 +443,7 @@ def _risk_quality(
             "lower": float(lower), "upper": float(upper), "examples": int(mask.sum()),
             "mean_predicted_error": confidence, "observed_error": observed,
         })
+    # Low-risk prefixes simulate accepting only safer answers.
     coverage = {}
     for target in (0.5, 0.7, 0.8, 0.9, 1.0):
         count = max(1, math.ceil(target * len(rows)))
@@ -422,6 +467,8 @@ def _risk_quality(
 
 
 def _paired_exact_p(helped: int, hurt: int) -> float:
+    """Compute a two-sided exact McNemar/binomial test."""
+
     discordant = helped + hurt
     if not discordant:
         return 1.0
@@ -437,6 +484,8 @@ def _bootstrap_delta(
     baseline_correct_key: str = "luna_correct",
     samples: int = 5000,
 ) -> list[float]:
+    """Bootstrap the paired EM difference against the primary model."""
+
     differences = np.asarray([
         float(_is_correct(str(row[candidate_key]), row["references"]))
         - float(row[baseline_correct_key])
@@ -464,6 +513,8 @@ def run_uncertainty_routing_cross_validation(
     seed: int = 42,
     output_path: Path | None = None,
 ) -> dict:
+    """Run an out-of-fold UQ diagnostic on labelled development data."""
+
     if folds < 2:
         raise ValueError("folds must be at least 2")
     if not 0.0 < calibration_fraction < 0.5:
@@ -474,6 +525,7 @@ def run_uncertainty_routing_cross_validation(
         raise ValueError("selective_coverage must be in (0, 1]")
     pre_routing_indices = _pre_routing_indices(pre_feature_mode)
 
+    # Prepare features once so every fold sees the same representation.
     extraction_cache = extractions or {}
     prepared = []
     order = {}
@@ -497,6 +549,7 @@ def run_uncertainty_routing_cross_validation(
         })
         order[example.question_id] = index
 
+    # Hashing makes fold assignment stable across machines and file order.
     assignments = {
         item["example"].question_id:
         int(_hash_fraction(item["example"].question_id, f"uq-fold-{seed}") * folds)
@@ -504,6 +557,7 @@ def run_uncertainty_routing_cross_validation(
     }
     rows = []
     fold_reports = []
+    # Each question is scored only by a model that did not fit that question.
     for fold in range(folds):
         held_out = [item for item in prepared if assignments[item["example"].question_id] == fold]
         remaining = [item for item in prepared if assignments[item["example"].question_id] != fold]
@@ -525,6 +579,7 @@ def run_uncertainty_routing_cross_validation(
         pre_fit_matrix = fit_matrix[:, pre_routing_indices]
         pre_calibration_matrix = calibration_matrix[:, pre_routing_indices]
         pre_held_matrix = held_matrix[:, pre_routing_indices]
+        # Pre-risk controls the call; full risks compare answers after the call.
         pre_luna_model = _RidgeLogit(prior_scale).fit(
             pre_fit_matrix, np.asarray([item["luna_error"] for item in fitting])
         )
@@ -547,6 +602,7 @@ def run_uncertainty_routing_cross_validation(
             np.asarray([item["mini_error"] for item in calibration]),
         )
         calibration_luna_risk = pre_luna_model.predict(pre_calibration_matrix)
+        # Thresholds come from calibration rows, never held-out outcomes.
         intervention_threshold = float(np.quantile(
             calibration_luna_risk, intervention_quantile, method="higher"
         ))
@@ -576,6 +632,7 @@ def run_uncertainty_routing_cross_validation(
             luna_risk = float(held_luna_risk[position])
             mini_risk = float(held_mini_risk[position])
             full_luna_risk = float(held_full_luna_risk[position])
+            # Positive gain means the secondary answer is predicted safer.
             expected_gain = full_luna_risk - mini_risk
             eligible = bool(metadata["model_disagreement"] and not is_no_answer(mini))
             high_risk = luna_risk >= intervention_threshold
@@ -614,6 +671,8 @@ def run_uncertainty_routing_cross_validation(
     rows.sort(key=lambda item: order[item["question_id"]])
 
     def routing_report(answer_key: str) -> dict:
+        """Compare one routing rule with the unchanged primary answer."""
+
         changed = [row for row in rows if not safe_surface_equivalent(
             str(row[answer_key]), str(row["luna_answer"])
         )]
@@ -703,6 +762,8 @@ def run_uncertainty_routing_cross_validation(
 
 
 def _serialize_logit(model: _RidgeLogit) -> dict:
+    """Store every value needed for frozen test inference."""
+
     return {
         "prior_scale": model.prior_scale,
         "feature_mean": model.mean_.tolist(),
@@ -714,6 +775,8 @@ def _serialize_logit(model: _RidgeLogit) -> dict:
 
 
 def _deserialize_logit(payload: Mapping) -> _RidgeLogit:
+    """Restore a fitted risk model without fitting on test data."""
+
     model = _RidgeLogit(float(payload["prior_scale"]))
     model.mean_ = np.asarray(payload["feature_mean"], dtype=float)
     model.scale_ = np.asarray(payload["feature_scale"], dtype=float)
@@ -757,6 +820,7 @@ def run_uncertainty_routing_train_dev(
         raise ValueError("intervention_quantile must be in (0, 1)")
     if not 0.0 < selective_coverage <= 1.0:
         raise ValueError("selective_coverage must be in (0, 1]")
+    # Test data is not used in this function.
     pre_indices = _pre_routing_indices(pre_feature_mode)
 
     def prepare(
@@ -765,6 +829,8 @@ def run_uncertainty_routing_train_dev(
         secondary_predictions: Mapping[str, Mapping],
         extractions: Mapping[str, Sequence[EvidenceObservation]],
     ) -> list[dict]:
+        """Build features and error labels for one labelled split."""
+
         prepared = []
         for example in examples:
             # build_uq_features is position-based despite its historical names:
@@ -809,6 +875,7 @@ def run_uncertainty_routing_train_dev(
     dev_primary_error = np.asarray([item["primary_error"] for item in dev])
     dev_secondary_error = np.asarray([item["secondary_error"] for item in dev])
 
+    # Fit on train, then calibrate probabilities and thresholds on dev.
     pre_primary = _RidgeLogit(prior_scale).fit(
         train_matrix[:, pre_indices], train_primary_error
     )
@@ -833,6 +900,7 @@ def run_uncertainty_routing_train_dev(
         metadata = item["metadata"]
         primary_answer = item["primary_answer"]
         secondary_answer = item["secondary_answer"]
+        # Switch only when the call was triggered and predicted gain is enough.
         expected_gain = float(post_primary_risk[index] - secondary_risk[index])
         triggered = bool(pre_risk[index] >= intervention_threshold)
         disagrees = bool(metadata["model_disagreement"])
@@ -868,6 +936,8 @@ def run_uncertainty_routing_train_dev(
         })
 
     def routing_report(answer_key: str) -> dict:
+        """Report paired changes against the frozen primary baseline."""
+
         changed = [row for row in rows if not safe_surface_equivalent(
             str(row[answer_key]), str(row["primary_answer"])
         )]
@@ -956,6 +1026,7 @@ def run_uncertainty_routing_train_dev(
             )
         },
     }
+    # This artifact is the only learned state allowed at official test time.
     model_artifact = {
         "protocol_version": UQ_ROUTING_PROTOCOL_VERSION,
         "configuration": summary["configuration"],
@@ -995,6 +1066,7 @@ def write_frozen_uncertainty_routing_predictions(
     """Apply a frozen train/dev model without reading any references."""
     if any(example.split != "test" for example in examples):
         raise ValueError("Frozen UQ prediction expects test inputs only")
+    # Apply the frozen model without test references.
     if tuple(model_artifact.get("feature_names", ())) != UQ_FEATURE_NAMES:
         raise ValueError("Frozen model feature names do not match this implementation")
     pre_feature_names = tuple(model_artifact["pre_feature_names"])
@@ -1012,6 +1084,7 @@ def write_frozen_uncertainty_routing_predictions(
     primary_name = str(model_artifact["configuration"]["primary_name"])
     secondary_name = str(model_artifact["configuration"]["secondary_name"])
 
+    # Partial caches would silently change the evaluated cohort, so fail early.
     missing_primary = [
         item.question_id for item in examples if item.question_id not in primary_predictions
     ]
@@ -1034,6 +1107,7 @@ def write_frozen_uncertainty_routing_predictions(
             extractions.get(example.question_id, ()),
         )
         prepared.append((example, features, metadata))
+    # All predictions below use frozen weights and frozen dev thresholds.
     matrix = np.vstack([item[1] for item in prepared])
     pre_risk = pre_primary.predict(matrix[:, pre_indices])
     post_primary_risk = post_primary.predict(matrix)
@@ -1043,6 +1117,7 @@ def write_frozen_uncertainty_routing_predictions(
     for index, (example, _, metadata) in enumerate(prepared):
         primary_answer = metadata["luna_answer"]
         secondary_answer = metadata["mini_answer"]
+        # No test label or reference is available in this decision.
         expected_gain = float(post_primary_risk[index] - secondary_risk[index])
         triggered = bool(pre_risk[index] >= intervention_threshold)
         disagrees = bool(metadata["model_disagreement"])
@@ -1096,6 +1171,7 @@ def evaluate_frozen_uncertainty_routing_predictions(
     output_path: Path | None = None,
 ) -> dict:
     """Score an already-frozen prediction cache against separately loaded refs."""
+    # References enter only in this final score step.
     rows = []
     for example in examples:
         if example.question_id not in predictions:
@@ -1114,6 +1190,8 @@ def evaluate_frozen_uncertainty_routing_predictions(
         rows.append(prediction)
 
     def routing_report(answer_key: str) -> dict:
+        """Measure which frozen test switches helped or hurt."""
+
         changed = [row for row in rows if not safe_surface_equivalent(
             str(row[answer_key]), str(row["primary_answer"])
         )]

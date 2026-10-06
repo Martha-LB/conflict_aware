@@ -1,3 +1,5 @@
+"""Tests for answer extraction and cache resume."""
+
 import io
 import urllib.error
 from pathlib import Path
@@ -16,6 +18,7 @@ from uacaa.schemas import Context, EvidenceObservation, PreparedExample
 
 
 def test_parse_and_cluster_context_answers():
+    # Paris and The Paris form one candidate; Lyon remains separate.
     response = """{
       "observations": [
         {"context_index": 0, "answerable": true, "candidate_answer": "Paris", "evidence_quote": "Paris", "directness": 1, "entailment": 0.9, "answer_type_match": 1, "temporal_fit": 0.5},
@@ -28,6 +31,7 @@ def test_parse_and_cluster_context_answers():
 
 
 def test_parser_requires_one_assessment_per_context():
+    # Missing a context is an error before the final quarantine attempt.
     response = """{
       "observations": [
         {"context_index": 0, "answerable": false, "candidate_answer": "", "evidence_quote": "", "directness": 0, "entailment": 0, "answer_type_match": 0, "temporal_fit": 0}
@@ -42,6 +46,7 @@ def test_parser_requires_one_assessment_per_context():
 
 
 def test_parser_quarantines_missing_or_malformed_assessments():
+    # Quarantine keeps valid contexts instead of dropping the whole question.
     missing = """{
       "observations": [
         {"context_index": 0, "answerable": false, "candidate_answer": "", "evidence_quote": "", "directness": 0, "entailment": 0, "answer_type_match": 0, "temporal_fit": 0}
@@ -66,6 +71,7 @@ def test_parser_quarantines_missing_or_malformed_assessments():
 
 
 def test_quote_validation_and_alignment():
+    # Safe alignment fixes formatting, but never skips words.
     assert evidence_quote_is_verbatim(
         "PARIS  is the capital", "Paris is\tthe capital."
     )
@@ -80,12 +86,15 @@ def test_quote_validation_and_alignment():
 
 
 def test_extraction_cache_resumes_without_repeating_calls(tmp_path: Path):
+    # Fake extraction makes resume behavior deterministic and free.
     examples = [
         PreparedExample(f"q-{index}", "train", f"Question {index}", [Context(0, "text")])
         for index in range(2)
     ]
 
     class Extractor:
+        """Count calls while returning one simple observation."""
+
         def __init__(self):
             self.calls = 0
 
@@ -111,10 +120,13 @@ def test_extraction_cache_resumes_without_repeating_calls(tmp_path: Path):
 
 
 def test_http_400_surfaces_api_message_without_retry(monkeypatch):
+    # A bad request should stop fast and show the API message.
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     calls = 0
 
     def fail(*args, **kwargs):
+        """Return the same client error on every attempted request."""
+
         nonlocal calls
         calls += 1
         body = io.BytesIO(b'{"error":{"message":"Unsupported parameter: temperature"}}')

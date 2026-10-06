@@ -1,3 +1,4 @@
+# Python local files
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -5,6 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# Generated experiment data
 artifacts/
 data/raw/
 data/derived/

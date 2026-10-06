@@ -1,3 +1,5 @@
+"""Build data files without test-answer leakage."""
+
 from __future__ import annotations
 
 import json
@@ -26,6 +28,7 @@ STRICT_EXCLUSION_FLAGS = {
 
 
 def write_jsonl(path: Path, records: Iterable[dict]) -> None:
+    # Write a temp file first, then replace.
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -35,6 +38,8 @@ def write_jsonl(path: Path, records: Iterable[dict]) -> None:
 
 
 def read_prepared(path: Path) -> list[PreparedExample]:
+    """Read the project JSONL format into typed examples."""
+
     examples: list[PreparedExample] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -44,6 +49,8 @@ def read_prepared(path: Path) -> list[PreparedExample]:
 
 
 def read_references(path: Path) -> dict[str, tuple[str, ...]]:
+    """Load hidden evaluation answers by question id."""
+
     references: dict[str, tuple[str, ...]] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -56,6 +63,8 @@ def read_references(path: Path) -> dict[str, tuple[str, ...]]:
 
 
 def read_evaluation_metadata(path: Path) -> dict[str, dict]:
+    """Load references and conflict labels used only for scoring."""
+
     metadata: dict[str, dict] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -71,6 +80,7 @@ def read_evaluation_metadata(path: Path) -> dict[str, dict]:
 
 
 def _test_input(example: PreparedExample) -> PreparedExample:
+    # Remove labels before test prediction.
     return PreparedExample(
         question_id=example.question_id,
         split=example.split,
@@ -83,6 +93,8 @@ def _test_input(example: PreparedExample) -> PreparedExample:
 
 
 def _write_test_pair(prefix: Path, examples: list[PreparedExample]) -> None:
+    """Write separate public inputs and private evaluation labels."""
+
     write_jsonl(
         Path(str(prefix) + ".inputs.jsonl"),
         (_test_input(item).to_dict() for item in examples),
@@ -101,6 +113,8 @@ def _write_test_pair(prefix: Path, examples: list[PreparedExample]) -> None:
 
 
 def is_strict_training_example(example: PreparedExample) -> bool:
+    """Accept only labelled train/dev rows without known data faults."""
+
     return (
         example.split in {"train", "dev"}
         and not (set(example.quality_flags) & STRICT_EXCLUSION_FLAGS)
@@ -115,8 +129,12 @@ def prepare_protocol(
     revision: str | None = None,
     ambigqa_paths: Iterable[Path] | None = None,
 ) -> dict:
+    """Create all frozen train, dev, and test protocol files."""
+
+    # Raw QACC stays unchanged.
     rows = load_raw_qacc(raw_path)
     ambigqa_files = list(ambigqa_paths or [])
+    # AmbigQA aliases improve scoring but never enter an inference prompt.
     upstream = load_ambigqa_references(ambigqa_files) if ambigqa_files else {}
     examples = [
         prepare_example(
@@ -128,6 +146,7 @@ def prepare_protocol(
     ]
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Weak keeps all rows; strict removes rows with annotation defects.
     for split in ("train", "dev"):
         weak = [example for example in examples if example.split == split]
         strict = [example for example in weak if is_strict_training_example(example)]
@@ -163,6 +182,7 @@ def prepare_protocol(
             "multiple_references": with_multiple,
         }
 
+    # Record hashes and label boundaries so the study can be reproduced.
     manifest = {
         "protocol_version": "1.2",
         "raw_path": str(raw_path.resolve()),

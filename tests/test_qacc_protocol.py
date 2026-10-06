@@ -1,3 +1,5 @@
+"""Tests for QACC parsing and test-label isolation."""
+
 import json
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from uacaa.qacc import (
 
 
 def _row(split="train", *, fourth="B", correct="Paris"):
+    """Create one row in the unusual schema used by QACC."""
+
     return {
         "annotation_task_id": 1,
         "split": split,
@@ -43,6 +47,7 @@ def _row(split="train", *, fourth="B", correct="Paris"):
 
 
 def test_audit_distinguishes_unassigned_context_from_missing_candidate():
+    # An irrelevant context is valid data, not a missing answer field.
     report = audit_rows([_row()])
     assert report["splits"]["train"]["contexts"] == 2
     assert report["splits"]["train"]["attributed_contexts"] == 1
@@ -50,6 +55,7 @@ def test_audit_distinguishes_unassigned_context_from_missing_candidate():
 
 
 def test_prepare_protocol_preserves_official_test_and_filters_strict(tmp_path: Path):
+    # Test input must not contain its answer.
     raw = tmp_path / "qacc.json"
     raw.write_text(json.dumps([_row(), _row("train", fourth="A"), _row("test")]))
     output = tmp_path / "derived"
@@ -62,6 +68,7 @@ def test_prepare_protocol_preserves_official_test_and_filters_strict(tmp_path: P
     assert test_inputs[0].supervision is None
     assert test_inputs[0].evaluation is None
     assert read_references(output / "test.official.references.jsonl")[test_inputs[0].question_id] == ("Paris",)
+    # Test labels are still available to the separate evaluator.
     metadata = read_evaluation_metadata(output / "test.official.references.jsonl")
     assert metadata[test_inputs[0].question_id]["has_conflict"] is False
 
@@ -77,6 +84,7 @@ def test_prepare_example_preserves_author_conflict_label_directly():
 
 
 def test_prepare_protocol_restores_ambigqa_multi_references(tmp_path: Path):
+    # Only singleAnswer aliases belong to the original QACC question.
     raw = tmp_path / "qacc.json"
     raw.write_text(json.dumps([_row(), _row("dev"), _row("test")]))
     ambigqa = tmp_path / "train_light.json"
@@ -113,6 +121,7 @@ def test_prepare_protocol_restores_ambigqa_multi_references(tmp_path: Path):
 
 
 def test_oracle_attribution_is_forbidden_on_test():
+    # Gold context attribution is never a legal test-time feature.
     example = prepare_example(_row("test"), 0)
     with pytest.raises(ValueError):
         annotated_observations(example)

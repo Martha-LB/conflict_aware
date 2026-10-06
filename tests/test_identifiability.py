@@ -1,3 +1,5 @@
+"""Tests for the final comparison report."""
+
 from pathlib import Path
 
 from uacaa.identifiability import evaluate_identifiability, write_identifiability_report
@@ -5,6 +7,8 @@ from uacaa.schemas import Context, PreparedExample
 
 
 def _examples():
+    """Create one conflict and one non-conflict test row."""
+
     return [
         PreparedExample("a", "test", "Q1?", [Context(0, "Alpha")]),
         PreparedExample("b", "test", "Q2?", [Context(0, "Beta")]),
@@ -12,6 +16,7 @@ def _examples():
 
 
 def test_identifiability_report_separates_candidate_availability_and_selection(tmp_path: Path):
+    # The oracle has a gold answer available. The resolver still must select it.
     systems = {
         "no_context": ({"a": {"answer": "wrong"}, "b": {"answer": "Beta"}}, "answer"),
         "explain": ({"a": {"answer": "Alpha"}, "b": {"answer": "wrong"}}, "answer"),
@@ -44,6 +49,7 @@ def test_identifiability_report_separates_candidate_availability_and_selection(t
             "oracle_candidate",
         ),
     }
+    # The report should show both resolver gain and remaining oracle gap.
     summary, rows = evaluate_identifiability(
         _examples(),
         {"a": ["Alpha"], "b": ["Beta"]},
@@ -59,6 +65,7 @@ def test_identifiability_report_separates_candidate_availability_and_selection(t
     assert summary["identifiability_gaps"]["overall"]["oracle_minus_resolver"] == 0.0
     assert summary["comparisons_to_primary"]["overall"]["robust"]["helped"] == 1
     assert summary["metrics"]["qacc_conflict"]["explain"]["examples"] == 1
+    # Human and machine-readable outputs must be written together.
     output = tmp_path / "report.json"
     write_identifiability_report(output, summary, rows)
     assert output.exists()
