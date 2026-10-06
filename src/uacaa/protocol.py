@@ -4,7 +4,15 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from .qacc import audit_rows, file_sha256, load_raw_qacc, prepare_example
+from .qacc import (
+    _question_key,
+    audit_rows,
+    evaluation_references,
+    file_sha256,
+    load_ambigqa_references,
+    load_raw_qacc,
+    prepare_example,
+)
 from .schemas import PreparedExample
 
 
@@ -105,9 +113,19 @@ def prepare_protocol(
     output_dir: Path,
     *,
     revision: str | None = None,
+    ambigqa_paths: Iterable[Path] | None = None,
 ) -> dict:
     rows = load_raw_qacc(raw_path)
-    examples = [prepare_example(row, position) for position, row in enumerate(rows)]
+    ambigqa_files = list(ambigqa_paths or [])
+    upstream = load_ambigqa_references(ambigqa_files) if ambigqa_files else {}
+    examples = [
+        prepare_example(
+            row,
+            position,
+            upstream_references=upstream.get(_question_key(row.get("question")), ()),
+        )
+        for position, row in enumerate(rows)
+    ]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for split in ("train", "dev"):
@@ -134,11 +152,27 @@ def prepare_protocol(
         json.dumps(audit, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    reference_coverage = {}
+    for split in ("train", "dev", "test"):
+        selected = [item for item in examples if item.split == split]
+        with_multiple = sum(len(evaluation_references(item)) > 1 for item in selected)
+        restored = sum(bool((item.supervision or {}).get("references")) for item in selected)
+        reference_coverage[split] = {
+            "examples": len(selected),
+            "restored_from_ambigqa": restored,
+            "multiple_references": with_multiple,
+        }
+
     manifest = {
-        "protocol_version": "1.0",
+        "protocol_version": "1.2",
         "raw_path": str(raw_path.resolve()),
         "raw_sha256": file_sha256(raw_path),
         "upstream_revision": revision,
+        "ambigqa_reference_files": [
+            {"path": str(path.resolve()), "sha256": file_sha256(path)}
+            for path in ambigqa_files
+        ],
+        "reference_coverage": reference_coverage,
         "raw_rows": len(rows),
         "strict_exclusion_flags": sorted(STRICT_EXCLUSION_FLAGS),
         "files": {
@@ -154,8 +188,15 @@ def prepare_protocol(
         },
         "leakage_policy": {
             "inference_inputs": ["question", "contexts.text", "contexts.source"],
-            "train_dev_only": ["supervision"],
-            "evaluation_only": ["evaluation.references", "evaluation.has_conflict"],
+            "train_dev_only": [
+                "supervision",
+                "supervision.has_conflict (QACC secondAnswerExist)",
+            ],
+            "evaluation_only": [
+                "supervision.references (restored AmbigQA aliases; never model input)",
+                "evaluation.references",
+                "evaluation.has_conflict",
+            ],
         },
     }
     (output_dir / "manifest.json").write_text(

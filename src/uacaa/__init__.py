@@ -1,13 +1,9 @@
-"""Uncertainty-aware candidate answer aggregation for conflicting-context QA."""
+"""Answer-risk guided selective revision for conflicting-context QA."""
 
-from .bayes import BayesianConditionalLogit
-from .schemas import Candidate, ChoiceSet, EvidenceObservation, PreparedExample
+from .schemas import Candidate, EvidenceObservation, PreparedExample
 
 __all__ = [
-    "BayesianConditionalLogit",
     "Candidate",
-    "ChoiceSet",
     "EvidenceObservation",
     "PreparedExample",
 ]
-

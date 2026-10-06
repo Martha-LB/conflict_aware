@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-import numpy as np
-
 
 @dataclass(frozen=True)
 class Context:
@@ -61,30 +59,3 @@ class PreparedExample:
             evaluation=value.get("evaluation"),
             quality_flags=list(value.get("quality_flags", [])),
         )
-
-
-@dataclass(frozen=True)
-class ChoiceSet:
-    question_id: str
-    answers: tuple[str, ...]
-    features: np.ndarray
-    correct_index: int | None = None
-    references: tuple[str, ...] = ()
-    has_conflict: bool | None = None
-
-    def __post_init__(self) -> None:
-        matrix = np.asarray(self.features, dtype=float)
-        object.__setattr__(self, "features", matrix)
-        if matrix.ndim != 2 or matrix.shape[0] != len(self.answers):
-            raise ValueError("features must have one row per candidate answer")
-        if self.correct_index is not None and not 0 <= self.correct_index < len(self.answers):
-            raise ValueError("correct_index is outside the candidate set")
-
-
-@dataclass(frozen=True)
-class Prediction:
-    question_id: str
-    answer: str | None
-    probabilities: tuple[float, ...]
-    confidence: float
-    abstained: bool

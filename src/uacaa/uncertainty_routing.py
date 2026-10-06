@@ -14,11 +14,16 @@ from scipy.optimize import minimize, minimize_scalar
 from scipy.special import expit
 
 from .clustering import cluster_observations
-from .cross_model import safe_surface_equivalent
 from .dependency import normalize_domain, source_category, token_jaccard
-from .normalization import exact_match, is_no_answer, normalize_answer, token_f1
+from .normalization import (
+    is_no_answer,
+    normalize_answer,
+    qacc_exact_match,
+    qacc_token_f1,
+    safe_surface_equivalent,
+)
+from .qacc import evaluation_references, qacc_conflict_label
 from .schemas import EvidenceObservation, PreparedExample
-from .two_stage import qacc_conflict_label
 
 
 UQ_ROUTING_PROTOCOL_VERSION = "1.1"
@@ -309,7 +314,9 @@ class _RidgeLogit:
 
 
 def _is_correct(answer: str, references: Sequence[str]) -> bool:
-    return not is_no_answer(answer) and any(exact_match(answer, value) for value in references)
+    return not is_no_answer(answer) and any(
+        qacc_exact_match(answer, value) for value in references
+    )
 
 
 def _answer_metrics(rows: Sequence[Mapping], answer_key: str) -> dict:
@@ -324,7 +331,9 @@ def _answer_metrics(rows: Sequence[Mapping], answer_key: str) -> dict:
         if is_no_answer(answer):
             f1_values.append(0.0)
         else:
-            f1_values.append(max((token_f1(answer, item) for item in references), default=0.0))
+            f1_values.append(
+                max((qacc_token_f1(answer, item) for item in references), default=0.0)
+            )
             covered.append(exact)
     return {
         "examples": len(rows),
@@ -475,7 +484,7 @@ def run_uncertainty_routing_cross_validation(
             mini_predictions.get(example.question_id),
             extraction_cache.get(example.question_id, ()),
         )
-        references = [str((example.supervision or {}).get("correct_answer", ""))]
+        references = evaluation_references(example)
         luna_correct = _is_correct(metadata["luna_answer"], references)
         mini_correct = _is_correct(metadata["mini_answer"], references)
         prepared.append({
@@ -766,7 +775,7 @@ def run_uncertainty_routing_train_dev(
                 secondary_predictions.get(example.question_id),
                 extractions.get(example.question_id, ()),
             )
-            references = [str((example.supervision or {}).get("correct_answer", ""))]
+            references = evaluation_references(example)
             primary_answer = metadata["luna_answer"]
             secondary_answer = metadata["mini_answer"]
             prepared.append({

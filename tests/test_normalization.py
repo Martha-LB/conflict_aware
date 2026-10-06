@@ -3,9 +3,23 @@ from uacaa.normalization import (
     best_answer_index,
     exact_match,
     normalize_answer,
+    qacc_exact_match,
+    qacc_normalize_text,
+    qacc_token_f1,
+    safe_surface_equivalent,
     target_matches_candidate,
     token_f1,
 )
+
+
+def test_qacc_metrics_reproduce_released_evaluator():
+    assert qacc_normalize_text("The U.S.A.") == "usa"
+    assert qacc_exact_match("The Beatles", "Beatles")
+    assert not qacc_exact_match("Yamuna", "Yamuna River")
+    assert not qacc_exact_match("3:2", "2:3")
+    assert qacc_normalize_text("3:2") == "32"
+    assert qacc_normalize_text("2:3") == "23"
+    assert qacc_token_f1("Season 5 Episode 17", "Season 5") == 2 * (2 / 4) / (1 + 2 / 4)
 
 
 def test_normalization_handles_articles_and_number_commas():
@@ -17,6 +31,14 @@ def test_normalization_handles_articles_and_number_commas():
 
 def test_numeric_conflicts_do_not_alias():
     assert not answers_match("1850", "1858")
+    assert not answers_match("3:2", "2:3")
+    assert not target_matches_candidate("3:2", "2:3")
+
+
+def test_safe_surface_equivalence_preserves_material_details():
+    assert safe_surface_equivalent("October", "Throughout the month of October")
+    assert not safe_surface_equivalent("1994", "October 31, 1994")
+    assert not safe_surface_equivalent("Paris", "Paris, Texas")
 
 
 def test_candidate_mapping_allows_safe_gold_containment():

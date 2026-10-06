@@ -10,7 +10,13 @@ from uacaa.protocol import (
     read_prepared,
     read_references,
 )
-from uacaa.qacc import audit_rows, prepare_example
+from uacaa.qacc import (
+    audit_rows,
+    evaluation_references,
+    load_ambigqa_references,
+    prepare_example,
+    qacc_conflict_label,
+)
 
 
 def _row(split="train", *, fourth="B", correct="Paris"):
@@ -58,6 +64,52 @@ def test_prepare_protocol_preserves_official_test_and_filters_strict(tmp_path: P
     assert read_references(output / "test.official.references.jsonl")[test_inputs[0].question_id] == ("Paris",)
     metadata = read_evaluation_metadata(output / "test.official.references.jsonl")
     assert metadata[test_inputs[0].question_id]["has_conflict"] is False
+
+
+def test_prepare_example_preserves_author_conflict_label_directly():
+    row = _row()
+    row["secondAnswerExist"] = "A"
+    # Deliberately leave secondAnswer missing. The target is the authors'
+    # judgment, not a value reconstructed from the answer fields.
+    example = prepare_example(row, 0)
+    assert example.supervision["has_conflict"] is True
+    assert qacc_conflict_label(example) is True
+
+
+def test_prepare_protocol_restores_ambigqa_multi_references(tmp_path: Path):
+    raw = tmp_path / "qacc.json"
+    raw.write_text(json.dumps([_row(), _row("dev"), _row("test")]))
+    ambigqa = tmp_path / "train_light.json"
+    ambigqa.write_text(
+        json.dumps(
+            [
+                {
+                    "question": "What is the capital of France?",
+                    "annotations": [
+                        {
+                            "type": "singleAnswer",
+                            "answer": ["Paris", "City of Paris"],
+                        },
+                        {
+                            "type": "multipleQAs",
+                            "qaPairs": [
+                                {"question": "Which Paris?", "answer": ["Paris, Texas"]}
+                            ],
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    index = load_ambigqa_references([ambigqa])
+    assert index["what is the capital of france"] == ("Paris", "City of Paris")
+
+    output = tmp_path / "derived"
+    manifest = prepare_protocol(raw, output, ambigqa_paths=[ambigqa])
+    train = read_prepared(output / "train.strict.jsonl")[0]
+    assert evaluation_references(train) == ["Paris", "City of Paris"]
+    assert manifest["protocol_version"] == "1.2"
+    assert manifest["reference_coverage"]["train"]["restored_from_ambigqa"] == 1
 
 
 def test_oracle_attribution_is_forbidden_on_test():

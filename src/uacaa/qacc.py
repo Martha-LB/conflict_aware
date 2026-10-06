@@ -4,15 +4,101 @@ import ast
 import hashlib
 import json
 import math
+import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
-from .normalization import best_answer_index, is_no_answer, normalize_answer
+from .normalization import (
+    best_answer_index,
+    is_no_answer,
+    normalize_answer,
+    qacc_normalize_text,
+)
 from .schemas import Context, PreparedExample
 
 
 ORDINALS = ("first", "second", "third")
+
+
+def qacc_conflict_label(example: PreparedExample) -> bool:
+    """Return the QACC author conflict label, with a legacy answer-count fallback."""
+    supervision = example.supervision or {}
+    if "has_conflict" in supervision:
+        return bool(supervision["has_conflict"])
+    answers = {
+        re.sub(r"\s+", " ", str(item.get("answer", "")).strip().lower())
+        for item in supervision.get("candidates", [])
+        if str(item.get("answer", "")).strip()
+    }
+    return len(answers) >= 2
+
+
+def _question_key(value: object) -> str:
+    return " ".join(str(value or "").casefold().split()).rstrip("?").strip()
+
+
+def _deduplicate_references(values: Iterable[object]) -> list[str]:
+    references: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if is_missing(value):
+            continue
+        answer = str(value).strip()
+        key = qacc_normalize_text(answer)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        references.append(answer)
+    return references
+
+
+def load_ambigqa_references(paths: Sequence[Path]) -> dict[str, tuple[str, ...]]:
+    """Index acceptable single-answer aliases from official AmbigQA light data.
+
+    QACC was sampled from AmbigQA, but its released train/dev rows omit the
+    ``ambigqa_answer`` list retained in the QACC test split.  The QACC paper's
+    evaluator scores against that upstream answer list, taking the maximum
+    over references.  This loader restores the corresponding aliases without
+    exposing them to inference.
+    """
+
+    collected: dict[str, list[str]] = {}
+    for path in paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"AmbigQA file must contain a JSON list: {path}")
+        for record in payload:
+            if not isinstance(record, dict):
+                continue
+            key = _question_key(record.get("question"))
+            if not key:
+                continue
+            answers: list[object] = []
+            for annotation in record.get("annotations", []):
+                if not isinstance(annotation, dict):
+                    continue
+                # QACC targets questions treated as unambiguous.  Do not mix
+                # answers to rewritten disambiguated qaPairs into the original
+                # question's reference set.
+                if annotation.get("type") == "singleAnswer":
+                    answers.extend(annotation.get("answer") or [])
+            merged = [*collected.get(key, []), *answers]
+            collected[key] = _deduplicate_references(merged)
+    return {key: tuple(values) for key, values in collected.items() if values}
+
+
+def evaluation_references(example: PreparedExample) -> list[str]:
+    """Return frozen evaluation references, falling back to QACC annotation."""
+
+    evaluation = example.evaluation or {}
+    supervision = example.supervision or {}
+    values = evaluation.get("references") or supervision.get("references") or []
+    references = _deduplicate_references(values)
+    if references:
+        return references
+    answer = supervision.get("correct_answer")
+    return [] if is_missing(answer) else [str(answer).strip()]
 
 
 def is_missing(value: Any) -> bool:
@@ -115,7 +201,12 @@ def _question_id(row: dict[str, Any], position: int) -> str:
     return f"qacc-{digest}"
 
 
-def prepare_example(row: dict[str, Any], position: int) -> PreparedExample:
+def prepare_example(
+    row: dict[str, Any],
+    position: int,
+    *,
+    upstream_references: Sequence[str] | None = None,
+) -> PreparedExample:
     texts = [str(value).strip() for value in row.get("contexts") or []]
     sources = row.get("sources") or []
     contexts = [
@@ -127,15 +218,23 @@ def prepare_example(row: dict[str, Any], position: int) -> PreparedExample:
         for index, text in enumerate(texts)
     ]
     annotations = candidate_annotations(row)
+    restored_references = _deduplicate_references(upstream_references or [])
     supervision = {
         "candidates": annotations,
+        # Preserve the authors' human annotation directly. Do not infer the
+        # target from candidate count, because malformed or missing answer
+        # fields must not silently rewrite the original judgment.
+        "has_conflict": row.get("secondAnswerExist") == "A",
         "correct_answer": None if is_missing(row.get("correctAnswer")) else str(row["correctAnswer"]).strip(),
+        # Evaluation-only aliases restored from upstream AmbigQA for train/dev.
+        # They are not inputs to extraction or answer generation.
+        "references": restored_references,
         "reasons": None if is_missing(row.get("reasons")) else str(row["reasons"]),
         "explanation": None if is_missing(row.get("explanation")) else str(row["explanation"]).strip(),
     }
     raw_references = row.get("ambigqa_answer")
     references = (
-        [str(value).strip() for value in raw_references if not is_missing(value)]
+        _deduplicate_references(raw_references)
         if isinstance(raw_references, list)
         else []
     )

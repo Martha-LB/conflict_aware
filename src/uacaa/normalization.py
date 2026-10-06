@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import string
 import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
@@ -71,6 +72,42 @@ def exact_match(left: object, right: object) -> bool:
     return bool(left_key) and left_key == right_key
 
 
+def qacc_normalize_text(value: object) -> str:
+    """Reproduce the normalization in QACC's released evaluator.
+
+    This is intentionally separate from :func:`normalize_answer`: the latter
+    is a more permissive internal canonicalizer used for candidate clustering,
+    whereas reported QACC EM/F1 must remain comparable with the paper.
+    """
+
+    text = str(value or "").lower()
+    text = "".join(character for character in text if character not in string.punctuation)
+    text = re.sub(r"\b(a|an|the)\b", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def qacc_exact_match(left: object, right: object) -> bool:
+    """QACC normalized exact match for one prediction/reference pair."""
+
+    return qacc_normalize_text(left) == qacc_normalize_text(right)
+
+
+def qacc_token_f1(left: object, right: object) -> float:
+    """Reproduce QACC's released word-overlap F1 implementation."""
+
+    left_tokens = qacc_normalize_text(left).split()
+    right_tokens = qacc_normalize_text(right).split()
+    if not left_tokens or not right_tokens:
+        return float(left_tokens == right_tokens)
+    # QACC's public evaluator uses set overlap rather than multiset overlap.
+    common = set(left_tokens) & set(right_tokens)
+    if not common:
+        return 0.0
+    precision = len(common) / len(left_tokens)
+    recall = len(common) / len(right_tokens)
+    return 2.0 * precision * recall / (precision + recall)
+
+
 def answers_match(left: object, right: object, *, threshold: float = 0.8) -> bool:
     left_key = normalize_answer(left)
     right_key = normalize_answer(right)
@@ -78,9 +115,12 @@ def answers_match(left: object, right: object, *, threshold: float = 0.8) -> boo
         return False
     if left_key == right_key:
         return True
-    left_numbers = set(re.findall(r"\d+", left_key))
-    right_numbers = set(re.findall(r"\d+", right_key))
-    if left_numbers and right_numbers and left_numbers != right_numbers:
+    # Numeric order is semantic in ratios, ranges, rankings, and many dates.
+    # A bag/set comparison incorrectly aliases inverse relations such as 3:2
+    # and 2:3 even though QACC's released evaluator distinguishes them.
+    left_numbers = tuple(re.findall(r"\d+", left_key))
+    right_numbers = tuple(re.findall(r"\d+", right_key))
+    if (left_numbers or right_numbers) and left_numbers != right_numbers:
         return False
     return token_f1(left_key, right_key) >= threshold
 
@@ -114,8 +154,8 @@ def target_matches_candidate(
             and target_tokens[1] in _COUNT_UNITS
         ):
             return True
-    target_numbers = set(re.findall(r"\d+", " ".join(target_tokens)))
-    candidate_numbers = set(re.findall(r"\d+", " ".join(candidate_tokens)))
+    target_numbers = tuple(re.findall(r"\d+", " ".join(target_tokens)))
+    candidate_numbers = tuple(re.findall(r"\d+", " ".join(candidate_tokens)))
     if target_numbers or candidate_numbers:
         if target_numbers != candidate_numbers:
             return False
@@ -147,3 +187,25 @@ def best_answer_index(
         return None
     index = int(max(range(len(scores)), key=scores.__getitem__))
     return index if scores[index] >= threshold else None
+_SAFE_SURFACE_MODIFIERS = {
+    "during", "each", "every", "in", "month", "months", "of", "on", "throughout",
+}
+
+
+def safe_surface_equivalent(left: object, right: object) -> bool:
+    """Match only harmless wrappers around the same minimal answer span."""
+    if exact_match(left, right):
+        return True
+    left_key = normalize_answer(left)
+    right_key = normalize_answer(right)
+    if not left_key or not right_key:
+        return False
+    if set(re.findall(r"\d+", left_key)) != set(re.findall(r"\d+", right_key)):
+        return False
+    left_core = [
+        token for token in left_key.split() if token not in _SAFE_SURFACE_MODIFIERS
+    ]
+    right_core = [
+        token for token in right_key.split() if token not in _SAFE_SURFACE_MODIFIERS
+    ]
+    return bool(left_core) and left_core == right_core

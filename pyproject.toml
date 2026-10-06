@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "uacaa-qacc"
 version = "0.1.0"
-description = "Uncertainty-aware candidate answer aggregation for QACC"
+description = "Answer-risk guided selective revision for QACC"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
@@ -23,4 +23,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from uacaa.answer_baselines import (
     DIRECT_RAG_SYSTEM_PROMPT,
+    NO_CONTEXT_SYSTEM_PROMPT,
     QACC_EXPLAIN_SYSTEM_PROMPT,
     evaluate_answer_cache,
     read_answer_cache,
@@ -49,6 +50,7 @@ def test_answer_baseline_prompts_require_minimal_answer_span():
     assert "minimal slot-filling answer span" in DIRECT_RAG_SYSTEM_PROMPT
     assert "minimal slot-filling answer span" in QACC_EXPLAIN_SYSTEM_PROMPT
     assert "reasoning only" in QACC_EXPLAIN_SYSTEM_PROMPT
+    assert "own knowledge" in NO_CONTEXT_SYSTEM_PROMPT
 
 
 def test_answer_baseline_reports_conflict_slice():

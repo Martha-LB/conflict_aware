@@ -10,7 +10,8 @@ from typing import Mapping, Protocol, Sequence
 
 import numpy as np
 
-from .normalization import exact_match, is_no_answer, token_f1
+from .normalization import is_no_answer, qacc_exact_match, qacc_token_f1
+from .qacc import evaluation_references
 from .schemas import PreparedExample
 
 
@@ -40,6 +41,17 @@ has five movies`; return `October 2, 2017`, not `It premiered on October 2, 2017
 `Holly Sherwood`, not `Holly Sherwood was the singer`."""
 
 
+NO_CONTEXT_SYSTEM_PROMPT = """Answer the factual question from your own knowledge.
+You will not receive retrieved passages. Return "unknown" when you do not know the
+answer. Do not invent sources or an explanation.
+
+The JSON `answer` value must contain only the minimal slot-filling answer span, never a
+sentence, restatement, justification, parenthetical note, or list of alternatives. For
+example, return `five`, not `The series has five movies`; return `October 2, 2017`, not
+`It premiered on October 2, 2017`; return `Holly Sherwood`, not `The singer was Holly
+Sherwood`."""
+
+
 class AnswerPredictor(Protocol):
     def predict(self, example: PreparedExample) -> dict: ...
 
@@ -64,7 +76,7 @@ class OpenAIAnswerBaseline:
         retries: int = 3,
         reasoning_effort: str | None = "none",
     ) -> None:
-        if style not in {"direct-rag", "qacc-explain-then-answer"}:
+        if style not in {"direct-rag", "qacc-explain-then-answer", "no-context"}:
             raise ValueError("Unknown answer-baseline style")
         self.model = model
         self.style = style
@@ -76,11 +88,11 @@ class OpenAIAnswerBaseline:
 
     @property
     def system_prompt(self) -> str:
-        return (
-            DIRECT_RAG_SYSTEM_PROMPT
-            if self.style == "direct-rag"
-            else QACC_EXPLAIN_SYSTEM_PROMPT
-        )
+        if self.style == "direct-rag":
+            return DIRECT_RAG_SYSTEM_PROMPT
+        if self.style == "qacc-explain-then-answer":
+            return QACC_EXPLAIN_SYSTEM_PROMPT
+        return NO_CONTEXT_SYSTEM_PROMPT
 
     def predict(self, example: PreparedExample) -> dict:
         key = os.environ.get(self.api_key_env, "").strip()
@@ -116,7 +128,14 @@ class OpenAIAnswerBaseline:
             },
             "messages": [
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": answer_prompt(example)},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {example.question}"
+                        if self.style == "no-context"
+                        else answer_prompt(example)
+                    ),
+                },
             ],
         }
         if self.reasoning_effort is not None:
@@ -242,8 +261,7 @@ def evaluate_answer_cache(
     rows: list[dict] = []
     for example in examples:
         if references is None:
-            gold = str((example.supervision or {}).get("correct_answer", "")).strip()
-            item_references = [gold] if gold else []
+            item_references = evaluation_references(example)
         else:
             item_references = [str(value) for value in references.get(example.question_id, [])]
         record = predictions.get(example.question_id, {})
@@ -251,10 +269,10 @@ def evaluate_answer_cache(
         abstained = not answer or is_no_answer(answer)
         exact = float(
             not abstained
-            and any(exact_match(answer, reference) for reference in item_references)
+            and any(qacc_exact_match(answer, reference) for reference in item_references)
         )
         f1 = (
-            max((token_f1(answer, reference) for reference in item_references), default=0.0)
+            max((qacc_token_f1(answer, reference) for reference in item_references), default=0.0)
             if not abstained
             else 0.0
         )
@@ -294,6 +312,12 @@ def evaluate_answer_cache(
         }
 
     summary = summarize(rows)
+    summary["evaluation_protocol"] = (
+        "qacc_public_normalized_em_f1_max_over_references"
+    )
+    summary["mean_reference_count"] = (
+        float(np.mean([len(row["references"]) for row in rows])) if rows else 0.0
+    )
     if evaluation_metadata is not None:
         summary["conflict_only"] = summarize(
             [row for row in rows if row["has_conflict"] is True]
@@ -312,6 +336,7 @@ def evaluate_answer_cache(
 
 __all__ = [
     "DIRECT_RAG_SYSTEM_PROMPT",
+    "NO_CONTEXT_SYSTEM_PROMPT",
     "QACC_EXPLAIN_SYSTEM_PROMPT",
     "OpenAIAnswerBaseline",
     "answer_prompt",

@@ -21,6 +21,20 @@ been frozen. Prepared test inputs and references are stored in physically
 separate files. Annotated candidates and context assignments are absent from
 the prepared test inputs.
 
+The released QACC train/dev rows omit the upstream `ambigqa_answer` aliases
+that its public evaluator uses for test. Protocol v1.2 restores those aliases
+from the official AmbigQA light `train_light.json` and `dev_light.json` files
+by an exact normalized-question join. All 394 raw train and 410 raw dev rows
+must match; the manifest records file hashes and split coverage. These aliases
+are evaluation-only and are never placed in an LLM prompt.
+
+Reported answer metrics reproduce QACC's released evaluator: lowercase,
+remove ASCII punctuation and the articles `a/an/the`, normalize whitespace,
+then compute exact string equality and word-overlap F1. For multiple references
+the maximum score is used. QACC's annotator-selected `correctAnswer` remains
+the supervision target and is also reported separately when needed; it is not
+silently merged into the official AmbigQA reference set.
+
 ## Missingness
 
 The official release contains non-standard JSON `NaN` tokens. They are parsed
