@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -14,6 +15,27 @@ from .schemas import EvidenceObservation, PreparedExample
 
 
 EVALUATION_PROTOCOL = "qacc_public_normalized_em_f1_max_over_references"
+
+
+def _paired_exact_p(helped: int, hurt: int) -> float:
+    """Two-sided exact McNemar test for paired binary outcomes."""
+
+    discordant = helped + hurt
+    if not discordant:
+        return 1.0
+    tail = sum(math.comb(discordant, index) for index in range(min(helped, hurt) + 1))
+    return min(1.0, 2.0 * tail / (2**discordant))
+
+
+def _bootstrap_interval(differences: np.ndarray, seed: int = 42) -> list[float]:
+    """Paired bootstrap interval for a mean EM difference."""
+
+    if not len(differences):
+        return [0.0, 0.0]
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(differences), size=(5000, len(differences)))
+    means = differences[indices].mean(axis=1)
+    return [float(value) for value in np.quantile(means, [0.025, 0.975])]
 
 
 def read_jsonl_records(path: Path) -> dict[str, dict]:
@@ -210,32 +232,40 @@ def evaluate_identifiability(
         "qacc_non_conflict": [row for row in rows if not row["has_conflict"]],
     }
 
-    def comparison(selected: Sequence[Mapping], name: str) -> dict:
-        """Count helpful and harmful changes against the primary answer."""
+    def pairwise_comparison(
+        selected: Sequence[Mapping], left: str, right: str
+    ) -> dict:
+        """Compare the right system with the left system on paired rows."""
 
         changed = [
             row
             for row in selected
-            if qacc_normalize_text(row[primary_name]["answer"])
-            != qacc_normalize_text(row[name]["answer"])
+            if qacc_normalize_text(row[left]["answer"])
+            != qacc_normalize_text(row[right]["answer"])
         ]
         helped = sum(
-            row[primary_name]["exact"] == 0 and row[name]["exact"] == 1
+            row[left]["exact"] == 0 and row[right]["exact"] == 1
             for row in selected
         )
         hurt = sum(
-            row[primary_name]["exact"] == 1 and row[name]["exact"] == 0
+            row[left]["exact"] == 1 and row[right]["exact"] == 0
             for row in selected
         )
-        primary_em = metrics(selected, primary_name)["answer_exact"]
-        method_em = metrics(selected, name)["answer_exact"]
+        differences = np.asarray(
+            [row[right]["exact"] - row[left]["exact"] for row in selected],
+            dtype=float,
+        )
         return {
-            "delta_exact": method_em - primary_em,
+            "left": left,
+            "right": right,
+            "delta_exact": float(differences.mean()) if len(differences) else 0.0,
             "changed": len(changed),
             "helped": helped,
             "hurt": hurt,
             "net_exact_changes": helped - hurt,
             "switch_precision": helped / (helped + hurt) if helped + hurt else None,
+            "bootstrap_95pct_em_delta": _bootstrap_interval(differences),
+            "mcnemar_exact_p_two_sided": _paired_exact_p(helped, hurt),
         }
 
     summary = {
@@ -254,9 +284,17 @@ def evaluate_identifiability(
         },
         "comparisons_to_primary": {
             slice_name: {
-                name: comparison(selected, name)
+                name: pairwise_comparison(selected, primary_name, name)
                 for name in systems
                 if name != primary_name
+            }
+            for slice_name, selected in slices.items()
+        },
+        "pairwise_comparisons": {
+            slice_name: {
+                f"{right}_vs_{left}": pairwise_comparison(selected, left, right)
+                for left_index, left in enumerate(systems)
+                for right in list(systems)[left_index + 1 :]
             }
             for slice_name, selected in slices.items()
         },
@@ -318,6 +356,24 @@ def write_identifiability_report(path: Path, summary: Mapping, rows: Sequence[Ma
                 f"{item['answer_exact']:.4f} | {item['answer_token_f1']:.4f} | "
                 f"{item['coverage']:.4f} |"
             )
+    lines.extend(
+        [
+            "",
+            "## Overall paired EM comparisons",
+            "",
+            "Positive delta means the right system is better.",
+            "",
+            "| Comparison | EM delta | 95% bootstrap interval | McNemar p |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for name, item in summary["pairwise_comparisons"]["overall"].items():
+        low, high = item["bootstrap_95pct_em_delta"]
+        lines.append(
+            f"| {name} | {item['delta_exact']:+.4f} | "
+            f"[{low:+.4f}, {high:+.4f}] | "
+            f"{item['mcnemar_exact_p_two_sided']:.4f} |"
+        )
     lines.extend(["", "## Identifiability gaps", ""])
     for slice_name, gaps in summary["identifiability_gaps"].items():
         lines.append(

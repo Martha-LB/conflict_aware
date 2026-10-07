@@ -4,8 +4,8 @@ import io
 import urllib.error
 from pathlib import Path
 
-from uacaa.clustering import cluster_observations
-from uacaa.extraction import (
+from conflict_maxent.clustering import cluster_observations
+from conflict_maxent.extraction import (
     OpenAICompatibleExtractor,
     align_evidence_quote,
     evidence_quote_is_verbatim,
@@ -14,7 +14,7 @@ from uacaa.extraction import (
     read_extraction_cache,
     write_extraction_cache,
 )
-from uacaa.schemas import Context, EvidenceObservation, PreparedExample
+from conflict_maxent.schemas import Context, EvidenceObservation, PreparedExample
 
 
 def test_parse_and_cluster_context_answers():

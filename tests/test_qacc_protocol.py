@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from uacaa.extraction import annotated_observations
-from uacaa.protocol import (
+from conflict_maxent.extraction import annotated_observations
+from conflict_maxent.protocol import (
     prepare_protocol,
     read_evaluation_metadata,
     read_prepared,
     read_references,
 )
-from uacaa.qacc import (
+from conflict_maxent.qacc import (
     audit_rows,
     evaluation_references,
     load_ambigqa_references,

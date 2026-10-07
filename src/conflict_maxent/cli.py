@@ -1,4 +1,4 @@
-"""Command line entry for the final ARSR experiment."""
+"""Command line entry for the soft-MaxEnt QACC experiment."""
 
 from __future__ import annotations
 
@@ -9,9 +9,17 @@ from pathlib import Path
 
 from .answer_baselines import (
     OpenAIAnswerBaseline,
+    OpenAIWeightedAnswerer,
     evaluate_answer_cache,
     read_answer_cache,
     write_answer_cache,
+)
+from .context_maxent import (
+    CONTEXT_MAXENT_PROTOCOL_VERSION,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_NLI_MODEL,
+    SentenceTransformersRuntime,
+    write_context_maxent_cache,
 )
 from .extraction import (
     EXTRACTION_PROTOCOL_VERSION,
@@ -28,11 +36,7 @@ from .identifiability import (
 )
 from .protocol import prepare_protocol, read_evaluation_metadata, read_prepared
 from .qacc import audit_rows, file_sha256, load_raw_qacc
-from .uncertainty_routing import (
-    evaluate_frozen_uncertainty_routing_predictions,
-    run_uncertainty_routing_train_dev,
-    write_frozen_uncertainty_routing_predictions,
-)
+from .soft_maxent import read_weight_cache
 
 
 # Small helpers used by all commands.
@@ -42,20 +46,23 @@ def _print(value: object) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True, default=str))
 
 
-def _read_jsonl(path: Path) -> dict[str, dict]:
-    """Load generic JSONL records and reject duplicate ids."""
+def _provenance_mismatches(previous: dict, current: dict) -> list[str]:
+    """Compare cache settings while accepting moved, byte-identical inputs."""
 
-    records: dict[str, dict] = {}
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            question_id = str(record["question_id"])
-            if question_id in records:
-                raise ValueError(f"Duplicate question_id in {path}: {question_id}")
-            records[question_id] = record
-    return records
+    path_hashes = {
+        "input": "input_sha256",
+        "weights": "weights_sha256",
+        "extractions": "extractions_sha256",
+    }
+    mismatches: list[str] = []
+    for key, value in current.items():
+        hash_key = path_hashes.get(key)
+        if hash_key and previous.get(hash_key) == current.get(hash_key):
+            # A path is only descriptive when its content hash is unchanged.
+            continue
+        if previous.get(key) != value:
+            mismatches.append(key)
+    return mismatches
 
 
 def _reasoning_effort(value: str) -> str | None:
@@ -121,12 +128,12 @@ def command_extract(args: argparse.Namespace) -> None:
             raise ValueError("Existing extraction cache has no provenance manifest")
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         mismatches = [
-            key for key, value in identity.items()
-            if previous.get(key, value) != value
-            and not (
+            key
+            for key in _provenance_mismatches(previous, identity)
+            if not (
                 key == "extraction_protocol_version"
-                and previous.get(key) == "3.1"
-                and value == "3.2"
+                and previous.get(key) in {None, "3.1"}
+                and identity[key] == "3.2"
             )
         ]
         if mismatches:
@@ -202,7 +209,7 @@ def command_answer_baseline(args: argparse.Namespace) -> None:
         if not manifest_path.exists():
             raise ValueError("Existing answer cache has no provenance manifest")
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        mismatches = [key for key, value in identity.items() if previous.get(key) != value]
+        mismatches = _provenance_mismatches(previous, identity)
         if mismatches:
             raise ValueError(
                 "Cannot resume answer cache with different provenance: "
@@ -265,144 +272,232 @@ def command_evaluate_answer(args: argparse.Namespace) -> None:
     _print({"output": str(args.output), "metrics": summary})
 
 
-def command_arsr_train_dev(args: argparse.Namespace) -> None:
-    """Fit ARSR on train and use dev only for calibration and selection."""
+def command_maxent_build(args: argparse.Namespace) -> None:
+    """Create all three passage-weight conditions without references."""
 
-    # Fit on train, then choose settings on dev.
-    summary = run_uncertainty_routing_train_dev(
-        read_prepared(args.train_data),
-        read_prepared(args.dev_data),
-        read_answer_cache(args.train_primary_predictions),
-        read_answer_cache(args.train_secondary_predictions),
-        read_answer_cache(args.dev_primary_predictions),
-        read_answer_cache(args.dev_secondary_predictions),
-        read_extraction_cache(args.train_extractions) if args.train_extractions else {},
-        read_extraction_cache(args.dev_extractions) if args.dev_extractions else {},
-        primary_name=args.primary_name,
-        secondary_name=args.secondary_name,
-        prior_scale=args.prior_scale,
-        intervention_quantile=args.intervention_quantile,
-        delta_margin=args.delta_margin,
-        selective_coverage=args.selective_coverage,
-        pre_feature_mode=args.pre_feature_mode,
-        seed=args.seed,
-        output_path=args.output,
-    )
-    # Hash every input artifact used to produce the frozen model.
-    input_paths = {
-        "train_data": args.train_data,
-        "dev_data": args.dev_data,
-        "train_primary_predictions": args.train_primary_predictions,
-        "train_secondary_predictions": args.train_secondary_predictions,
-        "dev_primary_predictions": args.dev_primary_predictions,
-        "dev_secondary_predictions": args.dev_secondary_predictions,
-        "train_extractions": args.train_extractions,
-        "dev_extractions": args.dev_extractions,
-    }
-    manifest = {
-        "protocol": summary["protocol"],
-        "protocol_version": summary["protocol_version"],
-        "configuration": summary["configuration"],
-        "inputs": {
-            key: {"path": str(path.resolve()), "sha256": file_sha256(path)}
-            for key, path in input_paths.items()
-            if path is not None
-        },
-        "outputs": {
-            "rows": str(args.output.resolve()),
-            "summary": str(args.output.with_suffix(".summary.json").resolve()),
-            "model": str(args.output.with_suffix(".model.json").resolve()),
-        },
+    examples = read_prepared(args.data)[args.offset :]
+    if args.limit is not None:
+        examples = examples[: args.limit]
+    identity = {
+        "protocol": "notebook_aligned_context_soft_maxent",
+        "protocol_version": CONTEXT_MAXENT_PROTOCOL_VERSION,
+        "input": str(args.data.resolve()),
+        "input_sha256": file_sha256(args.data),
+        "extractions": str(args.extractions.resolve()),
+        "extractions_sha256": file_sha256(args.extractions),
+        "embedding_model": args.embedding_model,
+        "nli_model": args.nli_model,
+        "uniform_mix": args.uniform_mix,
+        "cluster_floor": args.cluster_floor,
+        "slack_penalty": args.slack_penalty,
+        "max_iter": args.max_iter,
+        "tolerance": args.tolerance,
+        "offset": args.offset,
+        "limit": args.limit,
     }
     manifest_path = Path(str(args.output) + ".manifest.json")
+    temporary_path = args.output.with_suffix(args.output.suffix + ".tmp")
+    had_cache = args.output.exists() or temporary_path.exists()
+    if not args.no_resume and had_cache:
+        if not manifest_path.exists():
+            raise ValueError("Existing MaxEnt cache has no provenance manifest")
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mismatches = _provenance_mismatches(previous, identity)
+        if mismatches:
+            raise ValueError(
+                "Cannot resume MaxEnt cache with different provenance: "
+                + ", ".join(mismatches)
+            )
+        cached = read_weight_cache(args.output) if args.output.exists() else {}
+        if all(example.question_id in cached for example in examples):
+            _print(
+                {
+                    "requested": len(examples),
+                    "reused": len(examples),
+                    "extracted": 0,
+                    "output": str(args.output),
+                    "manifest": str(manifest_path),
+                }
+            )
+            return
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        json.dumps(
+            {**identity, "status": "running"},
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    _print({"output": str(args.output), "manifest": str(manifest_path), "metrics": summary})
-
-
-def command_arsr_predict(args: argparse.Namespace) -> None:
-    """Create official-test predictions using a frozen ARSR model."""
-
-    # Test references are not loaded here.
-    if args.output.exists():
-        raise ValueError(f"Frozen prediction output already exists: {args.output}")
-    model = json.loads(args.model.read_text(encoding="utf-8"))
-    progress = write_frozen_uncertainty_routing_predictions(
-        read_prepared(args.data),
-        read_answer_cache(args.primary_predictions),
-        read_answer_cache(args.secondary_predictions),
-        read_extraction_cache(args.extractions),
-        model,
-        args.output,
+    runtime = SentenceTransformersRuntime(
+        embedding_model=args.embedding_model,
+        nli_model=args.nli_model,
+        device=None if args.device == "auto" else args.device,
+        batch_size=args.batch_size,
     )
-    inputs = {
-        "data": args.data,
-        "primary_predictions": args.primary_predictions,
-        "secondary_predictions": args.secondary_predictions,
-        "extractions": args.extractions,
-        "model": args.model,
-    }
-    # This manifest proves that references were not a prediction input.
-    manifest = {
-        "protocol": "frozen_official_test_prediction_without_references",
-        "protocol_version": model["protocol_version"],
-        "configuration": model["configuration"],
-        "inputs": {
-            key: {"path": str(path.resolve()), "sha256": file_sha256(path)}
-            for key, path in inputs.items()
-        },
-        "output": {
-            "path": str(args.output.resolve()),
-            "sha256": file_sha256(args.output),
-        },
-        "progress": progress,
-    }
-    manifest_path = Path(str(args.output) + ".manifest.json")
+    progress = write_context_maxent_cache(
+        examples,
+        read_extraction_cache(args.extractions),
+        runtime,
+        args.output,
+        resume=not args.no_resume,
+        uniform_mix=args.uniform_mix,
+        cluster_floor=args.cluster_floor,
+        slack_penalty=args.slack_penalty,
+        max_iter=args.max_iter,
+        tolerance=args.tolerance,
+    )
     manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                **identity,
+                "output_sha256": file_sha256(args.output),
+                "progress": progress,
+                "status": "complete",
+            },
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     _print({**progress, "manifest": str(manifest_path)})
 
 
-def command_arsr_evaluate(args: argparse.Namespace) -> None:
-    """Join frozen predictions with references in a separate score step."""
+def command_answer_weighted(args: argparse.Namespace) -> None:
+    """Answer with frozen uniform, support-voting, or MaxEnt weights."""
 
-    # References enter only after prediction.
-    if args.output.exists():
-        raise ValueError(f"Scored output already exists: {args.output}")
-    summary = evaluate_frozen_uncertainty_routing_predictions(
-        read_prepared(args.data),
-        _read_jsonl(args.predictions),
-        read_evaluation_metadata(args.references),
-        seed=args.seed,
-        output_path=args.output,
+    examples = read_prepared(args.data)[args.offset :]
+    if args.limit is not None:
+        examples = examples[: args.limit]
+    weights = read_weight_cache(args.weights)
+    predictor = OpenAIWeightedAnswerer(
+        args.model,
+        weights,
+        args.condition,
+        endpoint=args.endpoint,
+        api_key_env=args.api_key_env,
+        timeout=args.timeout,
+        retries=args.retries,
+        reasoning_effort=_reasoning_effort(args.reasoning_effort),
     )
-    inputs = {
-        "data": args.data,
-        "predictions": args.predictions,
-        "references": args.references,
+    identity = {
+        "input": str(args.data.resolve()),
+        "input_sha256": file_sha256(args.data),
+        "weights": str(args.weights.resolve()),
+        "weights_sha256": file_sha256(args.weights),
+        "model": args.model,
+        "condition": args.condition,
+        "endpoint": args.endpoint,
+        "reasoning_effort": args.reasoning_effort,
+        "system_prompt_sha256": hashlib.sha256(
+            predictor.system_prompt.encode()
+        ).hexdigest(),
     }
-    manifest = {
-        "protocol": summary["protocol"],
-        "protocol_version": summary["protocol_version"],
-        "inputs": {
-            key: {"path": str(path.resolve()), "sha256": file_sha256(path)}
-            for key, path in inputs.items()
-        },
-        "outputs": {
-            "scored_rows": str(args.output.resolve()),
-            "summary": str(args.output.with_suffix(".summary.json").resolve()),
-        },
-    }
+    if bool(args.reuse_equivalent_answers) != bool(args.reuse_equivalent_weights):
+        raise ValueError(
+            "--reuse-equivalent-answers and --reuse-equivalent-weights must be used together"
+        )
+    seed_records: dict[str, dict] = {}
+    if args.reuse_equivalent_answers:
+        source_manifest_path = Path(
+            str(args.reuse_equivalent_answers) + ".manifest.json"
+        )
+        if not source_manifest_path.exists():
+            raise ValueError("Equivalent-answer source has no provenance manifest")
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_weights_hash = file_sha256(args.reuse_equivalent_weights)
+        required = {
+            "input_sha256": identity["input_sha256"],
+            "model": identity["model"],
+            "endpoint": identity["endpoint"],
+            "reasoning_effort": identity["reasoning_effort"],
+            "system_prompt_sha256": identity["system_prompt_sha256"],
+            "weights_sha256": source_weights_hash,
+        }
+        mismatches = [
+            key for key, value in required.items() if source_manifest.get(key) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                "Equivalent-answer source has different provenance: "
+                + ", ".join(mismatches)
+            )
+        source_weights = read_weight_cache(args.reuse_equivalent_weights)
+        source_answers = read_answer_cache(args.reuse_equivalent_answers)
+        source_predictor = OpenAIWeightedAnswerer(
+            args.model,
+            source_weights,
+            str(source_manifest["condition"]),
+            endpoint=args.endpoint,
+            api_key_env=args.api_key_env,
+            timeout=args.timeout,
+            retries=args.retries,
+            reasoning_effort=_reasoning_effort(args.reasoning_effort),
+        )
+        for example in examples:
+            if (
+                example.question_id in source_answers
+                and predictor.user_prompt(example) == source_predictor.user_prompt(example)
+            ):
+                seed_records[example.question_id] = source_answers[example.question_id]
+        identity["equivalent_reuse"] = {
+            "answers": str(args.reuse_equivalent_answers.resolve()),
+            "answers_sha256": file_sha256(args.reuse_equivalent_answers),
+            "weights": str(args.reuse_equivalent_weights.resolve()),
+            "weights_sha256": source_weights_hash,
+            "identical_prompts": len(seed_records),
+        }
     manifest_path = Path(str(args.output) + ".manifest.json")
+    temporary_path = args.output.with_suffix(args.output.suffix + ".tmp")
+    if not args.no_resume and (args.output.exists() or temporary_path.exists()):
+        if not manifest_path.exists():
+            raise ValueError("Existing weighted answer cache has no provenance manifest")
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mismatches = _provenance_mismatches(previous, identity)
+        if mismatches:
+            raise ValueError(
+                "Cannot resume weighted answer cache with different provenance: "
+                + ", ".join(mismatches)
+            )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        json.dumps(
+            {**identity, "offset": args.offset, "limit": args.limit, "status": "running"},
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    _print({"output": str(args.output), "manifest": str(manifest_path), "metrics": summary})
+    progress = write_answer_cache(
+        examples,
+        predictor,
+        args.output,
+        resume=not args.no_resume,
+        seed_records=seed_records,
+    )
+    manifest_path.write_text(
+        json.dumps(
+            {
+                **identity,
+                "offset": args.offset,
+                "limit": args.limit,
+                "progress": progress,
+                "status": "complete",
+            },
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _print({**progress, "output": str(args.output), "manifest": str(manifest_path)})
 
 
 def command_identifiability_report(args: argparse.Namespace) -> None:
@@ -477,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the small public CLI for the final experiment."""
 
     # Only final project commands are kept.
-    parser = argparse.ArgumentParser(prog="uacaa")
+    parser = argparse.ArgumentParser(prog="conflict-maxent")
     commands = parser.add_subparsers(dest="command", required=True)
 
     # Data preparation commands do not call a model.
@@ -531,53 +626,46 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.set_defaults(function=command_evaluate_answer)
 
-    # ARSR training, frozen prediction, and evaluation remain separate commands.
-    train = commands.add_parser(
-        "arsr-train-dev", help="Fit ARSR on train and calibrate it on dev"
+    # These three answer conditions share one prompt and differ only in weights.
+    maxent = commands.add_parser(
+        "maxent-build", help="Build uniform, support-voting, and soft-MaxEnt weights"
     )
-    train.add_argument("--train-data", type=Path, required=True)
-    train.add_argument("--dev-data", type=Path, required=True)
-    train.add_argument("--train-primary-predictions", type=Path, required=True)
-    train.add_argument("--train-secondary-predictions", type=Path, required=True)
-    train.add_argument("--dev-primary-predictions", type=Path, required=True)
-    train.add_argument("--dev-secondary-predictions", type=Path, required=True)
-    train.add_argument("--train-extractions", type=Path)
-    train.add_argument("--dev-extractions", type=Path)
-    train.add_argument("--primary-name", required=True)
-    train.add_argument("--secondary-name", required=True)
-    train.add_argument("--output", type=Path, required=True)
-    train.add_argument("--prior-scale", type=float, default=0.75)
-    train.add_argument("--intervention-quantile", type=float, default=0.75)
-    train.add_argument("--delta-margin", type=float, default=0.10)
-    train.add_argument("--selective-coverage", type=float, default=0.80)
-    train.add_argument(
-        "--pre-feature-mode",
-        choices=("full", "no-source-time", "answer-only"),
-        default="answer-only",
-    )
-    train.add_argument("--seed", type=int, default=42)
-    train.set_defaults(function=command_arsr_train_dev)
+    maxent.add_argument("--data", type=Path, required=True)
+    maxent.add_argument("--extractions", type=Path, required=True)
+    maxent.add_argument("--output", type=Path, required=True)
+    maxent.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    maxent.add_argument("--nli-model", default=DEFAULT_NLI_MODEL)
+    maxent.add_argument("--device", default="cpu")
+    maxent.add_argument("--batch-size", type=int, default=8)
+    maxent.add_argument("--uniform-mix", type=float, default=0.1)
+    maxent.add_argument("--cluster-floor", type=float, default=0.05)
+    maxent.add_argument("--slack-penalty", type=float, default=5.0)
+    maxent.add_argument("--max-iter", type=int, default=200)
+    maxent.add_argument("--tolerance", type=float, default=1e-6)
+    maxent.add_argument("--offset", type=int, default=0)
+    maxent.add_argument("--limit", type=int)
+    maxent.add_argument("--no-resume", action="store_true")
+    maxent.set_defaults(function=command_maxent_build)
 
-    predict = commands.add_parser(
-        "arsr-predict", help="Apply a frozen ARSR model without test references"
+    weighted = commands.add_parser(
+        "answer-weighted", help="Answer with one frozen passage-weight condition"
     )
-    predict.add_argument("--data", type=Path, required=True)
-    predict.add_argument("--primary-predictions", type=Path, required=True)
-    predict.add_argument("--secondary-predictions", type=Path, required=True)
-    predict.add_argument("--extractions", type=Path, required=True)
-    predict.add_argument("--model", type=Path, required=True)
-    predict.add_argument("--output", type=Path, required=True)
-    predict.set_defaults(function=command_arsr_predict)
-
-    arsr_evaluate = commands.add_parser(
-        "arsr-evaluate", help="Evaluate frozen ARSR predictions"
+    weighted.add_argument("--data", type=Path, required=True)
+    weighted.add_argument("--weights", type=Path, required=True)
+    weighted.add_argument("--output", type=Path, required=True)
+    weighted.add_argument("--model", required=True)
+    weighted.add_argument(
+        "--condition",
+        choices=("uniform", "support-voting", "soft-maxent"),
+        required=True,
     )
-    arsr_evaluate.add_argument("--data", type=Path, required=True)
-    arsr_evaluate.add_argument("--predictions", type=Path, required=True)
-    arsr_evaluate.add_argument("--references", type=Path, required=True)
-    arsr_evaluate.add_argument("--output", type=Path, required=True)
-    arsr_evaluate.add_argument("--seed", type=int, default=42)
-    arsr_evaluate.set_defaults(function=command_arsr_evaluate)
+    weighted.add_argument("--offset", type=int, default=0)
+    weighted.add_argument("--limit", type=int)
+    weighted.add_argument("--no-resume", action="store_true")
+    weighted.add_argument("--reuse-equivalent-answers", type=Path)
+    weighted.add_argument("--reuse-equivalent-weights", type=Path)
+    _add_api_arguments(weighted)
+    weighted.set_defaults(function=command_answer_weighted)
 
     pool = commands.add_parser(
         "candidate-pool", help="Build a reference-free candidate oracle input"

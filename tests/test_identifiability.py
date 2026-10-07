@@ -2,13 +2,13 @@
 
 from pathlib import Path
 
-from uacaa.identifiability import (
+from conflict_maxent.identifiability import (
     evaluate_identifiability,
     read_jsonl_records,
     write_candidate_pool,
     write_identifiability_report,
 )
-from uacaa.schemas import Context, EvidenceObservation, PreparedExample
+from conflict_maxent.schemas import Context, EvidenceObservation, PreparedExample
 
 
 def _examples():

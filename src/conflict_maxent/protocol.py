@@ -154,17 +154,8 @@ def prepare_protocol(
         write_jsonl(output_dir / f"{split}.strict.jsonl", (item.to_dict() for item in strict))
 
     test = [example for example in examples if example.split == "test"]
-    # The official test retains duplicates and all quality flags. A separate
-    # sensitivity cohort removes repeated question/id pairs without changing labels.
+    # The official test retains the exact rows and quality flags from QACC.
     _write_test_pair(output_dir / "test.official", test)
-    seen: set[str] = set()
-    deduplicated: list[PreparedExample] = []
-    for item in test:
-        key = item.question.casefold().strip()
-        if key not in seen:
-            seen.add(key)
-            deduplicated.append(item)
-    _write_test_pair(output_dir / "test.deduplicated_sensitivity", deduplicated)
 
     audit = audit_rows(rows)
     (output_dir / "audit.json").write_text(
@@ -202,8 +193,6 @@ def prepare_protocol(
             "dev_strict": "dev.strict.jsonl",
             "test_official_inputs": "test.official.inputs.jsonl",
             "test_official_references": "test.official.references.jsonl",
-            "test_deduplicated_sensitivity_inputs": "test.deduplicated_sensitivity.inputs.jsonl",
-            "test_deduplicated_sensitivity_references": "test.deduplicated_sensitivity.references.jsonl",
             "audit": "audit.json",
         },
         "leakage_policy": {

@@ -2,15 +2,17 @@
 
 from pathlib import Path
 
-from uacaa.answer_baselines import (
+from conflict_maxent.answer_baselines import (
     DIRECT_RAG_SYSTEM_PROMPT,
     NO_CONTEXT_SYSTEM_PROMPT,
     QACC_EXPLAIN_SYSTEM_PROMPT,
+    WEIGHTED_RAG_SYSTEM_PROMPT,
     evaluate_answer_cache,
     read_answer_cache,
     write_answer_cache,
+    weighted_answer_prompt,
 )
-from uacaa.schemas import Context, PreparedExample
+from conflict_maxent.schemas import Context, PreparedExample
 
 
 class _Predictor:
@@ -52,12 +54,47 @@ def test_answer_baseline_cache_resumes_and_evaluates(tmp_path: Path):
     assert summary["coverage"] == 1.0
 
 
+def test_answer_cache_accepts_only_explicit_seed_records(tmp_path: Path):
+    # An identical-prompt caller may seed one answer; the other still calls the model.
+    output = tmp_path / "seeded.jsonl"
+    predictor = _Predictor()
+    progress = write_answer_cache(
+        _examples(),
+        predictor,
+        output,
+        seed_records={"0": {"question_id": "0", "answer": "Paris"}},
+    )
+    assert progress == {"requested": 2, "reused": 1, "extracted": 1}
+    assert predictor.calls == 1
+
+
 def test_answer_baseline_prompts_require_minimal_answer_span():
     # Long answer sentences can lower QACC exact match.
     assert "minimal slot-filling answer span" in DIRECT_RAG_SYSTEM_PROMPT
     assert "minimal slot-filling answer span" in QACC_EXPLAIN_SYSTEM_PROMPT
     assert "reasoning only" in QACC_EXPLAIN_SYSTEM_PROMPT
     assert "own knowledge" in NO_CONTEXT_SYSTEM_PROMPT
+    assert "weight may be wrong" in WEIGHTED_RAG_SYSTEM_PROMPT
+
+
+def test_weighted_prompt_changes_only_weight_values():
+    # Passage order and text stay fixed across all MaxEnt controls.
+    example = PreparedExample(
+        "q",
+        "test",
+        "Capital?",
+        [
+            Context(0, "Paris is the capital.", "one.example"),
+            Context(1, "Lyon is the capital.", "two.example"),
+        ],
+    )
+    uniform = weighted_answer_prompt(example, [0.5, 0.5])
+    weighted = weighted_answer_prompt(example, [0.8, 0.2])
+    assert uniform.index("Paris") < uniform.index("Lyon")
+    assert weighted.index("Paris") < weighted.index("Lyon")
+    assert uniform.replace("0.500000", "WEIGHT") == weighted.replace(
+        "0.800000", "WEIGHT"
+    ).replace("0.200000", "WEIGHT")
 
 
 def test_answer_baseline_reports_conflict_slice():

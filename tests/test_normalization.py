@@ -1,6 +1,6 @@
 """Tests for answer matching and the QACC score."""
 
-from uacaa.normalization import (
+from conflict_maxent.normalization import (
     answers_match,
     best_answer_index,
     exact_match,

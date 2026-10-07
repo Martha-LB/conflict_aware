@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conflict-maxent"
+version = "0.1.0"
+description = "Methods for conflicting-context QA"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "sentence-transformers",
+  "torch",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+conflict-maxent = "conflict_maxent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
