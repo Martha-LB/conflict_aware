@@ -23,6 +23,7 @@ from .extraction import (
 from .identifiability import (
     evaluate_identifiability,
     read_jsonl_records,
+    write_candidate_pool,
     write_identifiability_report,
 )
 from .protocol import prepare_protocol, read_evaluation_metadata, read_prepared
@@ -443,6 +444,21 @@ def command_identifiability_report(args: argparse.Namespace) -> None:
     )
 
 
+def command_candidate_pool(args: argparse.Namespace) -> None:
+    """Build the reference-free candidate set used by the oracle diagnostic."""
+
+    if args.output.exists():
+        raise ValueError(f"Candidate pool output already exists: {args.output}")
+    progress = write_candidate_pool(
+        read_prepared(args.data),
+        read_answer_cache(args.primary_predictions),
+        read_answer_cache(args.secondary_predictions),
+        read_extraction_cache(args.extractions),
+        args.output,
+    )
+    _print(progress)
+
+
 def _add_api_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the same network options to all model commands."""
 
@@ -562,6 +578,16 @@ def build_parser() -> argparse.ArgumentParser:
     arsr_evaluate.add_argument("--output", type=Path, required=True)
     arsr_evaluate.add_argument("--seed", type=int, default=42)
     arsr_evaluate.set_defaults(function=command_arsr_evaluate)
+
+    pool = commands.add_parser(
+        "candidate-pool", help="Build a reference-free candidate oracle input"
+    )
+    pool.add_argument("--data", type=Path, required=True)
+    pool.add_argument("--primary-predictions", type=Path, required=True)
+    pool.add_argument("--secondary-predictions", type=Path, required=True)
+    pool.add_argument("--extractions", type=Path, required=True)
+    pool.add_argument("--output", type=Path, required=True)
+    pool.set_defaults(function=command_candidate_pool)
 
     report = commands.add_parser(
         "identifiability-report", help="Build the final QACC comparison"

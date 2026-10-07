@@ -2,8 +2,13 @@
 
 from pathlib import Path
 
-from uacaa.identifiability import evaluate_identifiability, write_identifiability_report
-from uacaa.schemas import Context, PreparedExample
+from uacaa.identifiability import (
+    evaluate_identifiability,
+    read_jsonl_records,
+    write_candidate_pool,
+    write_identifiability_report,
+)
+from uacaa.schemas import Context, EvidenceObservation, PreparedExample
 
 
 def _examples():
@@ -71,3 +76,24 @@ def test_identifiability_report_separates_candidate_availability_and_selection(t
     assert output.exists()
     assert output.with_suffix(".rows.jsonl").exists()
     assert output.with_suffix(".md").exists()
+
+
+def test_candidate_pool_uses_models_and_contexts_without_references(tmp_path: Path):
+    # The diagnostic pool contains observable answers but never gold references.
+    examples = _examples()
+    output = tmp_path / "candidates.jsonl"
+    progress = write_candidate_pool(
+        examples,
+        {"a": {"answer": "Alpha"}, "b": {"answer": "wrong"}},
+        {"a": {"answer": "other"}, "b": {"answer": "Beta"}},
+        {"a": [EvidenceObservation(0, "context answer")]},
+        output,
+    )
+    records = read_jsonl_records(output)
+    assert progress["examples"] == 2
+    assert [card["answer"] for card in records["a"]["candidate_cards"]] == [
+        "Alpha",
+        "other",
+        "context answer",
+    ]
+    assert "references" not in records["a"]

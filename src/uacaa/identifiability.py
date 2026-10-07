@@ -8,8 +8,9 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .clustering import cluster_observations
 from .normalization import is_no_answer, qacc_exact_match, qacc_normalize_text, qacc_token_f1
-from .schemas import PreparedExample
+from .schemas import EvidenceObservation, PreparedExample
 
 
 EVALUATION_PROTOCOL = "qacc_public_normalized_em_f1_max_over_references"
@@ -28,6 +29,56 @@ def read_jsonl_records(path: Path) -> dict[str, dict]:
                     raise ValueError(f"Duplicate question_id in {path}: {question_id}")
                 records[question_id] = record
     return records
+
+
+def write_candidate_pool(
+    examples: Sequence[PreparedExample],
+    primary_predictions: Mapping[str, Mapping],
+    secondary_predictions: Mapping[str, Mapping],
+    extractions: Mapping[str, Sequence[EvidenceObservation]],
+    output_path: Path,
+) -> dict:
+    """Save candidates that are available without reading gold references."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for example in examples:
+            primary = str(
+                primary_predictions.get(example.question_id, {}).get("answer", "unknown")
+            ).strip()
+            secondary = str(
+                secondary_predictions.get(example.question_id, {}).get("answer", "unknown")
+            ).strip()
+
+            # Context answers are grouped before they enter the oracle pool.
+            clusters = cluster_observations(extractions.get(example.question_id, ()))
+            cards: list[dict] = []
+            seen: set[str] = set()
+            for answer, origin in [
+                (primary, "primary_model"),
+                (secondary, "secondary_model"),
+                *((cluster.answer, "context_extraction") for cluster in clusters),
+            ]:
+                key = qacc_normalize_text(answer)
+                if not key or is_no_answer(answer) or key in seen:
+                    continue
+                seen.add(key)
+                cards.append(
+                    {
+                        "candidate_id": f"C{len(cards) + 1}",
+                        "answer": answer,
+                        "origin": origin,
+                    }
+                )
+            record = {
+                "question_id": example.question_id,
+                "primary_answer": primary or "unknown",
+                "candidate_cards": cards,
+            }
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    temporary.replace(output_path)
+    return {"examples": len(examples), "output": str(output_path)}
 
 
 def _field(record: Mapping, field: str) -> object:
@@ -287,5 +338,6 @@ def write_identifiability_report(path: Path, summary: Mapping, rows: Sequence[Ma
 __all__ = [
     "evaluate_identifiability",
     "read_jsonl_records",
+    "write_candidate_pool",
     "write_identifiability_report",
 ]
